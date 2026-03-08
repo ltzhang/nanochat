@@ -13,7 +13,7 @@ Notable features:
 """
 
 from functools import partial
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -37,6 +37,12 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Ngram embedding injection.
+    # List of layer indices to inject into.  Empty = disabled.
+    # Set by the training script before model construction; each listed layer
+    # receives one slice of the ngram embedding of size n_embd.
+    # embed_dim fed to NgramBridge must equal len(ngram_inject_layers) * n_embd.
+    ngram_inject_layers: list = field(default_factory=list)
 
 
 def norm(x):
@@ -175,6 +181,13 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        # Ngram injection gates: one Linear(n_embd → 1) per injection layer.
+        # gate = sigmoid(linear(x)) ∈ (0,1), initialized near 0 so injection
+        # starts disabled and grows only if it improves the loss.
+        self.ngram_gate = nn.ModuleDict({
+            str(i): nn.Linear(config.n_embd, 1, bias=True)
+            for i in config.ngram_inject_layers
+        })
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -228,6 +241,12 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+
+        # Ngram gate init: zero weight + large-negative bias → sigmoid ≈ 0 at start.
+        # Injection is effectively disabled at init; the model learns to open the gate.
+        for ng_gate in self.ngram_gate.values():
+            torch.nn.init.zeros_(ng_gate.weight)
+            torch.nn.init.constant_(ng_gate.bias, -5.0)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -334,7 +353,8 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        ngram_gate = sum(p.numel() for p in self.ngram_gate.parameters())
+        total = wte + value_embeds + lm_head + transformer_matrices + scalars + ngram_gate
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
@@ -342,6 +362,7 @@ class GPT(nn.Module):
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
+            'ngram_gate': ngram_gate,
             'total': total,
         }
 
@@ -356,7 +377,8 @@ class GPT(nn.Module):
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        ngram_gate_params = list(self.ngram_gate.parameters())
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(ngram_gate_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -371,6 +393,10 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
+        # Ngram gate params (Linear(n_embd, 1) per injection layer) — AdamW at scalar rate.
+        # Gate starts near-zero (bias=-5) and opens slowly; a modest LR is intentional.
+        if ngram_gate_params:
+            param_groups.append(dict(kind='adamw', params=ngram_gate_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -385,7 +411,8 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean',
+                ngram_by_layer=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -402,6 +429,13 @@ class GPT(nn.Module):
         x0 = x  # save initial normalized embedding for x0 residual
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            # Ngram injection: gated additive residual before this block.
+            # ngram_by_layer is a dict {layer_idx: (B, T, n_embd)} tensor.
+            if ngram_by_layer is not None and str(i) in self.ngram_gate:
+                ng = ngram_by_layer.get(i)
+                if ng is not None:
+                    gate = torch.sigmoid(self.ngram_gate[str(i)](x))  # (B, T, 1)
+                    x = x + gate * ng.to(x.dtype)
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
@@ -416,7 +450,7 @@ class GPT(nn.Module):
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
             # inference: just return the logits directly

@@ -24,7 +24,7 @@ from contextlib import nullcontext, contextmanager
 import wandb
 import torch
 
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt import GPT, GPTConfig, has_ve
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -78,6 +78,10 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# Ngram embedding injection (optional)
+parser.add_argument("--ngram-embed-dir", type=str, default="", help="path to ngram embed store root dir (empty = disabled)")
+parser.add_argument("--ngram-cache-mb", type=int, default=4096, help="DRAM cache budget for ngram embeddings in MB")
+parser.add_argument("--ngram-lr", type=float, default=3e-4, help="learning rate for ngram sparse Adam optimizer")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -129,10 +133,17 @@ def build_model_meta(depth):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
+    # Ngram injection layers: same alternating pattern as value embeddings.
+    # Set here so the config is consistent for checkpoint saving.
+    ngram_inject_layers = (
+        [i for i in range(depth) if has_ve(i, depth)]
+        if args.ngram_embed_dir else []
+    )
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        ngram_inject_layers=ngram_inject_layers,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -316,11 +327,26 @@ if resuming:
     del optimizer_data
 
 # -----------------------------------------------------------------------------
+# Ngram bridge (optional)
+ngram_bridge = None
+if args.ngram_embed_dir:
+    from ngram_embed.torch_bridge import NgramBridge
+    ngram_bridge = NgramBridge(
+        args.ngram_embed_dir,
+        inject_layers=model_config.ngram_inject_layers,
+        cache_mb=args.ngram_cache_mb,
+        device=device,
+    )
+    print0(f"Ngram bridge: embed_dim={ngram_bridge.embed_dim}, "
+           f"inject_layers={model_config.ngram_inject_layers}, "
+           f"global_step={ngram_bridge.global_step}")
+
+# -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, ngram_bridge=ngram_bridge)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+x, y, dataloader_state_dict, ngram_np, embed_ids_np = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -480,6 +506,10 @@ while True:
             },
             rank=ddp_rank,
         )
+        # Persist ngram global_step and flush dirty rows to disk alongside checkpoint.
+        if ngram_bridge is not None:
+            ngram_bridge.save_meta()
+            ngram_bridge.flush()
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
@@ -491,12 +521,19 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
+        ngram_by_layer = None
+        if ngram_bridge is not None and ngram_np is not None:
+            # Build a differentiable (B, T, embed_dim) tensor via the mini-table
+            # proxy.  Gradients are accumulated internally per unique n-gram row;
+            # call ngram_bridge.step() after optimizer.step() to flush them.
+            ngram_gpu = ngram_bridge.lookup_differentiable(ngram_np, embed_ids_np)
+            ngram_by_layer = ngram_bridge.split_to_layers(ngram_gpu)
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(x, y, ngram_by_layer=ngram_by_layer)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        x, y, dataloader_state_dict, ngram_np, embed_ids_np = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -508,6 +545,10 @@ while True:
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
     model.zero_grad(set_to_none=True)
+    # Ngram sparse Adam update — after backbone optimizer so their LR schedules are independent.
+    if ngram_bridge is not None:
+        current_ngram_lr = args.ngram_lr * get_lr_multiplier(step)
+        ngram_bridge.step(lr=current_ngram_lr)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()

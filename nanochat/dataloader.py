@@ -74,7 +74,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000, ngram_bridge=None,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -155,11 +155,17 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
         state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
 
+        # Ngram lookup on CPU while data is still in cpu_inputs (pinned memory).
+        # Done before HtoD so it overlaps with the GPU processing the previous batch.
+        ngram_np, embed_ids_np = None, None
+        if ngram_bridge is not None:
+            ngram_np, embed_ids_np = ngram_bridge.lookup(cpu_inputs)
+
         # Single HtoD copy into persistent GPU buffer and yield
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
-        yield inputs, targets, state_dict
+        yield inputs, targets, state_dict, ngram_np, embed_ids_np
 
 def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
-    """Helper that omits state_dict from yields."""
-    for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
+    """Helper that omits state_dict and ngram fields from yields."""
+    for inputs, targets, *_ in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
         yield inputs, targets
