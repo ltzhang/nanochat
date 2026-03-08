@@ -16,6 +16,7 @@ Fallback to the original if you have very limited data AND long documents:
 https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
 """
 
+import numpy as np
 import torch
 import pyarrow.parquet as pq
 
@@ -164,3 +165,95 @@ def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
     """Helper that omits state_dict from yields."""
     for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
         yield inputs, targets
+
+
+def sampled_ngram_data_loader_with_state(
+    sample_bin_path, ngram_list_path, B, T, split,
+    device="cuda", resume_state_dict=None, seed=1337,
+):
+    """
+    Dataloader over precomputed fixed-size sampled records plus per-token ngram ids.
+
+    sample_bin_path format:
+      - uint16 records of shape (chunk_size + 1), where chunk_size must equal T.
+    ngram_list_path format:
+      - uint32 records of shape (chunk_size), one ngram id per input token position.
+
+    This loader is intended for pretraining with ngram id supervision.
+    """
+    assert split in ["train", "val"], "split must be 'train' or 'val'"
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    use_cuda = device == "cuda"
+
+    rec_tokens = T + 1
+    token_data = np.memmap(sample_bin_path, dtype=np.uint16, mode="r")
+    ngram_data = np.memmap(ngram_list_path, dtype=np.uint32, mode="r")
+    assert token_data.size % rec_tokens == 0, f"{sample_bin_path} has invalid size for chunk_size={T}"
+    n_records = token_data.size // rec_tokens
+    assert ngram_data.size == n_records * T, (
+        f"{ngram_list_path} size mismatch: got {ngram_data.size}, expected {n_records * T}"
+    )
+    local_records = (n_records - ddp_rank + ddp_world_size - 1) // ddp_world_size
+    assert local_records > 0, "Not enough records for current world size"
+
+    resume_epoch = resume_state_dict.get("epoch", 1) if resume_state_dict is not None else 1
+    resume_local_pos = resume_state_dict.get("local_pos", 0) if resume_state_dict is not None else 0
+    epoch = max(1, int(resume_epoch))
+    local_pos = int(resume_local_pos)
+
+    row_buffer = torch.empty((B, rec_tokens), dtype=torch.long)
+    row_ngram_buffer = torch.empty((B, T), dtype=torch.long)
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
+    cpu_ngram = torch.empty(B * T, dtype=torch.long, pin_memory=use_cuda)
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+    gpu_ngram = torch.empty(B * T, dtype=torch.long, device=device)
+    cpu_inputs = cpu_buffer[:B * T].view(B, T)
+    cpu_targets = cpu_buffer[B * T:].view(B, T)
+    inputs = gpu_buffer[:B * T].view(B, T)
+    targets = gpu_buffer[B * T:].view(B, T)
+    ngram_ids = gpu_ngram.view(B, T)
+
+    while True:
+        # Deterministic local permutation per epoch; train split shuffles, val is sequential.
+        if split == "train":
+            rng = torch.Generator(device="cpu")
+            rng.manual_seed(seed + epoch)
+            perm = torch.randperm(local_records, generator=rng)
+        else:
+            perm = torch.arange(local_records, dtype=torch.long)
+
+        # Consume whole batches; drop tail for constant shape.
+        max_pos = local_records - (local_records % B)
+        if max_pos == 0:
+            raise ValueError(f"Not enough local records ({local_records}) for device batch size {B}")
+        local_pos = min(local_pos, max_pos)
+        if local_pos >= max_pos:
+            epoch += 1
+            local_pos = 0
+            continue
+
+        batch_local_ids = perm[local_pos:local_pos + B]
+        local_pos += B
+
+        for row_idx, local_id_t in enumerate(batch_local_ids):
+            local_id = int(local_id_t.item())
+            global_id = ddp_rank + local_id * ddp_world_size
+            tok_start = global_id * rec_tokens
+            ng_start = global_id * T
+            row_buffer[row_idx].copy_(torch.tensor(token_data[tok_start:tok_start + rec_tokens], dtype=torch.long))
+            row_ngram_buffer[row_idx].copy_(torch.tensor(ngram_data[ng_start:ng_start + T], dtype=torch.long))
+
+        cpu_inputs.copy_(row_buffer[:, :-1])
+        cpu_targets.copy_(row_buffer[:, 1:])
+        cpu_ngram.copy_(row_ngram_buffer.view(-1))
+        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        gpu_ngram.copy_(cpu_ngram, non_blocking=use_cuda)
+
+        state_dict = {"epoch": epoch, "local_pos": local_pos, "local_records": local_records}
+        yield inputs, targets, ngram_ids, state_dict
+
+
+def sampled_ngram_data_loader(*args, **kwargs):
+    """Helper that omits state_dict from yields."""
+    for inputs, targets, ngram_ids, state_dict in sampled_ngram_data_loader_with_state(*args, **kwargs):
+        yield inputs, targets, ngram_ids

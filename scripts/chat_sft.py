@@ -117,7 +117,10 @@ for name, fallback, source in [
         print0(f"Using {name}={arg_val}")
 
 orig_model = model
-model = torch.compile(model, dynamic=False)
+if getattr(model.config, "value_embeds_on_cpu", False) or getattr(model.config, "ngram_embeds_on_cpu", False):
+    print0("Loaded model uses CPU-resident embedding mode: skipping torch.compile for stability with mixed CPU/GPU graph.")
+else:
+    model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank

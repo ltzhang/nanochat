@@ -26,6 +26,19 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    # Default to legacy behavior: keep value embeddings on model device.
+    if "value_embeds_on_cpu" not in model_config_kwargs:
+        model_config_kwargs["value_embeds_on_cpu"] = False
+        log0(f"Patching missing value_embeds_on_cpu in model config to False")
+    if "ngram_vocab_size" not in model_config_kwargs:
+        model_config_kwargs["ngram_vocab_size"] = 0
+        log0(f"Patching missing ngram_vocab_size in model config to 0")
+    if "ngram_embed_every" not in model_config_kwargs:
+        model_config_kwargs["ngram_embed_every"] = 4
+        log0(f"Patching missing ngram_embed_every in model config to 4")
+    if "ngram_embeds_on_cpu" not in model_config_kwargs:
+        model_config_kwargs["ngram_embeds_on_cpu"] = False
+        log0(f"Patching missing ngram_embeds_on_cpu in model config to False")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -42,8 +55,14 @@ def _patch_missing_keys(model_data, model_config):
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
-        # Save the model state parameters
+        # Save the model state parameters.
+        # ngram_embeds.*.weight and value_embeds.*.weight are included automatically
+        # (they are nn.Embedding parameters registered in the model's state_dict).
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
+        ngram_keys = [k for k in model_data if k.startswith("ngram_embeds.")]
+        if ngram_keys:
+            ngram_mb = sum(v.numel() * v.element_size() for k, v in model_data.items() if k.startswith("ngram_embeds.")) / 1024**2
+            logger.info(f"Checkpoint includes ngram_embeds ({len(ngram_keys)} tensors, {ngram_mb:.1f} MB)")
         torch.save(model_data, model_path)
         logger.info(f"Saved model parameters to: {model_path}")
         # Save the metadata dict as json

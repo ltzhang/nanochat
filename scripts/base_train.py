@@ -18,6 +18,7 @@ import json
 import time
 import math
 import argparse
+import numpy as np
 from dataclasses import asdict
 from contextlib import contextmanager
 
@@ -26,7 +27,11 @@ import torch
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.dataloader import (
+    tokenizing_distributed_data_loader_bos_bestfit,
+    tokenizing_distributed_data_loader_with_state_bos_bestfit,
+    sampled_ngram_data_loader_with_state,
+)
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -52,6 +57,12 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--value-embeds-on-cpu", action="store_true", help="keep value embedding parameters on CPU and copy looked-up activations to GPU each step (single-process only)")
+parser.add_argument("--train-sample-bin", type=str, default="", help="path to sampled token records (uint16, shape=(chunk+1)); enables ngram-id training path")
+parser.add_argument("--train-sample-ngram-list", type=str, default="", help="path to sampled ngram id records (uint32, shape=(chunk)); default: <train-sample-bin>.ngram_list")
+parser.add_argument("--ngram-vocab-size", type=int, default=-1, help="total ngram id vocabulary size (including id 0). -1 = infer from ngram_list max id")
+parser.add_argument("--ngram-embed-every", type=int, default=4, help="inject ngram embedding every K layers (counting backward from final layer)")
+parser.add_argument("--ngram-embeds-on-cpu", action="store_true", help="keep ngram embedding parameters on CPU and copy looked-up activations to GPU each step (single-process only)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -125,6 +136,46 @@ token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
+
+def infer_ngram_vocab_size(ngram_list_path):
+    # Fast path: read from sidecar .meta JSON written by `ngram sample`
+    meta_path = ngram_list_path + ".meta"
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        if "vocab_size" in meta:
+            return int(meta["vocab_size"])
+    # Slow fallback: scan entire file for max ID (can be slow for multi-GB files)
+    print0(f"Warning: {meta_path} not found; scanning {ngram_list_path} for max ngram id (may be slow).")
+    ngram_data = np.memmap(ngram_list_path, dtype=np.uint32, mode="r")
+    if ngram_data.size == 0:
+        return 1
+    max_id = int(ngram_data.max())
+    return max_id + 1
+
+
+using_sampled_ngram_data = args.train_sample_bin != ""
+train_sample_ngram_list_path = ""
+resolved_ngram_vocab_size = 0
+if using_sampled_ngram_data:
+    train_sample_ngram_list_path = args.train_sample_ngram_list if args.train_sample_ngram_list else (args.train_sample_bin + ".ngram_list")
+    if not os.path.exists(args.train_sample_bin):
+        raise FileNotFoundError(f"--train-sample-bin not found: {args.train_sample_bin}")
+    if not os.path.exists(train_sample_ngram_list_path):
+        raise FileNotFoundError(f"ngram_list file not found: {train_sample_ngram_list_path}")
+    if args.ngram_vocab_size > 0:
+        resolved_ngram_vocab_size = args.ngram_vocab_size
+    else:
+        resolved_ngram_vocab_size = infer_ngram_vocab_size(train_sample_ngram_list_path)
+        print0(f"Auto-inferred ngram_vocab_size={resolved_ngram_vocab_size:,} from {train_sample_ngram_list_path}")
+    if resolved_ngram_vocab_size <= 1:
+        raise ValueError(f"Inferred/configured ngram_vocab_size={resolved_ngram_vocab_size}. Expected >1 when using sampled ngram data.")
+else:
+    if args.ngram_vocab_size > 0:
+        resolved_ngram_vocab_size = args.ngram_vocab_size
+        print0(f"WARNING: --ngram-vocab-size={resolved_ngram_vocab_size} set but --train-sample-bin not provided. "
+               f"Ngram embeddings will exist in the model but ngram_ids will always be None — they will never be trained.")
+
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
@@ -139,6 +190,10 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        value_embeds_on_cpu=args.value_embeds_on_cpu,
+        ngram_vocab_size=resolved_ngram_vocab_size,
+        ngram_embed_every=args.ngram_embed_every,
+        ngram_embeds_on_cpu=args.ngram_embeds_on_cpu,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -161,6 +216,12 @@ if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
+    # assign=True replaces tensors in-place including their device, so a checkpoint saved
+    # without value_embeds_on_cpu would put value_embeds back on GPU.  Re-enforce here.
+    if model.config.value_embeds_on_cpu:
+        model.value_embeds.to(device="cpu")
+    if model.config.ngram_embeds_on_cpu:
+        model.ngram_embeds.to(device="cpu")
     del model_data # free up this memory after the copy
 
 # -----------------------------------------------------------------------------
@@ -244,7 +305,10 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if args.value_embeds_on_cpu or args.ngram_embeds_on_cpu:
+    print0("CPU-resident embedding mode enabled: skipping torch.compile for stability with mixed CPU/GPU graph.")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -330,9 +394,24 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+if using_sampled_ngram_data:
+    train_loader = sampled_ngram_data_loader_with_state(
+        sample_bin_path=args.train_sample_bin,
+        ngram_list_path=train_sample_ngram_list_path,
+        B=args.device_batch_size,
+        T=args.max_seq_len,
+        split="train",
+        device=device,
+        resume_state_dict=dataloader_resume_state_dict,
+    )
+    x, y, ngram_ids, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+else:
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict
+    )
+    x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+    ngram_ids = None
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -406,6 +485,14 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+
+
+def format_dataloader_state(state):
+    if "pq_idx" in state:
+        return f"{state['epoch']} pq: {state['pq_idx']} rg: {state['rg_idx']}"
+    if "local_pos" in state:
+        return f"{state['epoch']} local_pos: {state['local_pos']}/{state['local_records']}"
+    return str(state)
 
 # Go!
 while True:
@@ -503,14 +590,17 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, y, ngram_ids=ngram_ids)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        if using_sampled_ngram_data:
+            x, y, ngram_ids, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        else:
+            x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -558,7 +648,7 @@ while True:
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
     else:
         eta_str = ""
-    epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    epoch = format_dataloader_state(dataloader_state_dict)
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {

@@ -37,6 +37,15 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Store value embeddings on CPU and ship looked-up activations to model device each step.
+    # Saves GPU memory but increases host<->device transfer overhead.
+    value_embeds_on_cpu: bool = False
+    # Ngram embedding vocabulary size (0 disables ngram embedding path). ID 0 = no ngram.
+    ngram_vocab_size: int = 0
+    # Inject ngram embeddings every K layers (counting backward from final layer).
+    ngram_embed_every: int = 4
+    # Store ngram embeddings on CPU and ship looked-up activations to model device each step.
+    ngram_embeds_on_cpu: bool = False
 
 
 def norm(x):
@@ -53,6 +62,12 @@ class Linear(nn.Linear):
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
+
+def has_periodic_embed(layer_idx, n_layer, period):
+    """Returns True if layer is selected by periodic schedule, always including the final layer."""
+    assert period >= 1
+    return (n_layer - 1 - layer_idx) % period == 0
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
@@ -77,7 +92,9 @@ class CausalSelfAttention(nn.Module):
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        use_value = has_ve(layer_idx, config.n_layer)
+        use_ngram = config.ngram_vocab_size > 0 and has_periodic_embed(layer_idx, config.n_layer, config.ngram_embed_every)
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if (use_value or use_ngram) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -181,6 +198,11 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.ngram_embeds = nn.ModuleDict({
+            str(i): nn.Embedding(config.ngram_vocab_size, kv_dim, padding_idx=0)
+            for i in range(config.n_layer)
+            if config.ngram_vocab_size > 0 and has_periodic_embed(i, config.n_layer, config.ngram_embed_every)
+        })
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -190,6 +212,32 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+
+    def _lookup_value_embedding(self, layer_idx, idx, out_device, out_dtype):
+        ve_embed = self.value_embeds[str(layer_idx)]
+        # Optional CPU offload: lookup on CPU, then ship only the looked-up activations.
+        if self.config.value_embeds_on_cpu:
+            # idx is a small (B×T) integer tensor — sync GPU→CPU copy is negligible.
+            # non_blocking has no effect on non-pinned CUDA→CPU copies, so omit it.
+            idx_cpu = idx.to(device="cpu")
+            ve = F.embedding(idx_cpu, ve_embed.weight)
+            if out_device.type == "cuda":
+                # pin_memory() page-locks the CPU buffer, enabling a true DMA async transfer.
+                # non_blocking=True lets the CPU thread return immediately; CUDA stream ordering
+                # guarantees the data is resident in GPU memory before any kernel reads it.
+                ve = ve.pin_memory()
+            return ve.to(device=out_device, dtype=out_dtype, non_blocking=(out_device.type == "cuda"))
+        return ve_embed(idx).to(dtype=out_dtype)
+
+    def _lookup_ngram_embedding(self, layer_idx, ngram_ids, out_device, out_dtype):
+        ng_embed = self.ngram_embeds[str(layer_idx)]
+        if self.config.ngram_embeds_on_cpu:
+            ngram_ids_cpu = ngram_ids.to(device="cpu")
+            ng = F.embedding(ngram_ids_cpu, ng_embed.weight, padding_idx=ng_embed.padding_idx)
+            if out_device.type == "cuda":
+                ng = ng.pin_memory()
+            return ng.to(device=out_device, dtype=out_dtype, non_blocking=(out_device.type == "cuda"))
+        return ng_embed(ngram_ids).to(dtype=out_dtype)
 
     @torch.no_grad()
     def init_weights(self):
@@ -229,6 +277,10 @@ class GPT(nn.Module):
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
+        for nge in self.ngram_embeds.values():
+            torch.nn.init.uniform_(nge.weight, -s, s)
+            if nge.padding_idx is not None:
+                nge.weight[nge.padding_idx].zero_()
 
         # Gate weights init to zero so gates start at sigmoid(0) = 0.5, scaled by 2 -> 1.0 (neutral)
         for block in self.transformer.h:
@@ -247,6 +299,15 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
+            for nge in self.ngram_embeds.values():
+                nge.to(dtype=COMPUTE_DTYPE)
+
+        # Optional: keep value embedding parameters on CPU to reduce GPU memory usage.
+        # During forward we'll lookup on CPU and copy activations to the model device.
+        if self.config.value_embeds_on_cpu:
+            self.value_embeds.to(device="cpu")
+        if self.config.ngram_embeds_on_cpu:
+            self.ngram_embeds.to(device="cpu")
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -312,7 +373,8 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
+        ngram_embeds_numel = sum(ng.weight.numel() for ng in self.ngram_embeds.values())
+        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel + ngram_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
@@ -339,14 +401,16 @@ class GPT(nn.Module):
         # Count each group separately (mirrors the grouping in setup_optimizers)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
+        ngram_embeds = sum(p.numel() for p in self.ngram_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + ngram_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
+            'ngram_embeds': ngram_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
@@ -356,15 +420,18 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
+        if ddp and (self.config.value_embeds_on_cpu or self.config.ngram_embeds_on_cpu):
+            raise ValueError("CPU-resident embedding mode (value/ngram) is not compatible with DDP/NCCL training. Use single-process training for this mode.")
 
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
+        ngram_embeds_params = list(self.ngram_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(ngram_embeds_params) + len(resid_params) + len(x0_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -376,6 +443,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=ngram_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
@@ -393,7 +461,15 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', ngram_ids=None):
+        # Assert ngram_ids are provided when the model has ngram embeddings configured.
+        # Silently running without ngram_ids would train/evaluate a different model than intended.
+        if self.ngram_embeds and ngram_ids is None:
+            raise AssertionError(
+                "Model has ngram embeddings configured but ngram_ids=None. "
+                "Pass ngram_ids to forward(). "
+                "Inference/evaluation without ngram_ids is not yet implemented."
+            )
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -411,7 +487,10 @@ class GPT(nn.Module):
         x0 = x  # save initial normalized embedding for x0 residual
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            ve = self._lookup_value_embedding(i, idx, x.device, x.dtype) if str(i) in self.value_embeds else None
+            if ngram_ids is not None and str(i) in self.ngram_embeds:
+                ng = self._lookup_ngram_embedding(i, ngram_ids, x.device, x.dtype)
+                ve = ng if ve is None else (ve + ng)
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
@@ -439,6 +518,11 @@ class GPT(nn.Module):
         - batch size is 1
         - ids and the yielded tokens are simple Python lists and ints
         """
+        if self.ngram_embeds:
+            raise AssertionError(
+                "generate() does not support ngram embeddings yet. "
+                "Add per-token ngram_ids lookup from token sequence first."
+            )
         assert isinstance(tokens, list)
         device = self.get_device()
         rng = None
