@@ -30,6 +30,10 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "value_embeds_on_cpu" not in model_config_kwargs:
         model_config_kwargs["value_embeds_on_cpu"] = False
         log0(f"Patching missing value_embeds_on_cpu in model config to False")
+    # Default to legacy behavior: value embeddings enabled.
+    if "value_embeds_enabled" not in model_config_kwargs:
+        model_config_kwargs["value_embeds_enabled"] = True
+        log0(f"Patching missing value_embeds_enabled in model config to True")
     if "ngram_vocab_size" not in model_config_kwargs:
         model_config_kwargs["ngram_vocab_size"] = 0
         log0(f"Patching missing ngram_vocab_size in model config to 0")

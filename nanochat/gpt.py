@@ -40,6 +40,8 @@ class GPTConfig:
     # Store value embeddings on CPU and ship looked-up activations to model device each step.
     # Saves GPU memory but increases host<->device transfer overhead.
     value_embeds_on_cpu: bool = False
+    # Enable Value Embeddings (ResFormer-style) path.
+    value_embeds_enabled: bool = True
     # Ngram embedding vocabulary size (0 disables ngram embedding path). ID 0 = no ngram.
     ngram_vocab_size: int = 0
     # Inject ngram embeddings every K layers (counting backward from final layer).
@@ -59,9 +61,9 @@ class Linear(nn.Linear):
         return F.linear(x, self.weight.to(dtype=x.dtype))
 
 
-def has_ve(layer_idx, n_layer):
+def has_ve(layer_idx, n_layer, enabled=True):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
-    return layer_idx % 2 == (n_layer - 1) % 2
+    return enabled and (layer_idx % 2 == (n_layer - 1) % 2)
 
 
 def has_periodic_embed(layer_idx, n_layer, period):
@@ -92,7 +94,7 @@ class CausalSelfAttention(nn.Module):
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
-        use_value = has_ve(layer_idx, config.n_layer)
+        use_value = has_ve(layer_idx, config.n_layer, config.value_embeds_enabled)
         use_ngram = config.ngram_vocab_size > 0 and has_periodic_embed(layer_idx, config.n_layer, config.ngram_embed_every)
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if (use_value or use_ngram) else None
 
@@ -197,7 +199,11 @@ class GPT(nn.Module):
         # Value embeddings (ResFormer-style): alternating layers, last layer always included
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.value_embeds = nn.ModuleDict({
+            str(i): nn.Embedding(padded_vocab_size, kv_dim)
+            for i in range(config.n_layer)
+            if has_ve(i, config.n_layer, config.value_embeds_enabled)
+        })
         self.ngram_embeds = nn.ModuleDict({
             str(i): nn.Embedding(config.ngram_vocab_size, kv_dim, padding_idx=0)
             for i in range(config.n_layer)

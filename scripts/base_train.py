@@ -58,6 +58,7 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--value-embeds-on-cpu", action="store_true", help="keep value embedding parameters on CPU and copy looked-up activations to GPU each step (single-process only)")
+parser.add_argument("--disable-value-embeds", action="store_true", help="disable value embedding module entirely")
 parser.add_argument("--train-sample-bin", type=str, default="", help="path to sampled token records (uint16, shape=(chunk+1)); enables ngram-id training path")
 parser.add_argument("--train-sample-ngram-list", type=str, default="", help="path to sampled ngram id records (uint32, shape=(chunk)); default: <train-sample-bin>.ngram_list")
 parser.add_argument("--ngram-vocab-size", type=int, default=-1, help="total ngram id vocabulary size (including id 0). -1 = infer from ngram_list max id")
@@ -191,6 +192,7 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         value_embeds_on_cpu=args.value_embeds_on_cpu,
+        value_embeds_enabled=not args.disable_value_embeds,
         ngram_vocab_size=resolved_ngram_vocab_size,
         ngram_embed_every=args.ngram_embed_every,
         ngram_embeds_on_cpu=args.ngram_embeds_on_cpu,
