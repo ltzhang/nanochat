@@ -34,15 +34,42 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "value_embeds_enabled" not in model_config_kwargs:
         model_config_kwargs["value_embeds_enabled"] = True
         log0(f"Patching missing value_embeds_enabled in model config to True")
+    n_layer = int(model_config_kwargs.get("n_layer", 0))
+
     if "ngram_vocab_size" not in model_config_kwargs:
         model_config_kwargs["ngram_vocab_size"] = 0
         log0(f"Patching missing ngram_vocab_size in model config to 0")
-    if "ngram_embed_every" not in model_config_kwargs:
-        model_config_kwargs["ngram_embed_every"] = 4
-        log0(f"Patching missing ngram_embed_every in model config to 4")
+    if "ngram_embeds_enabled" not in model_config_kwargs:
+        model_config_kwargs["ngram_embeds_enabled"] = True
+        log0(f"Patching missing ngram_embeds_enabled in model config to True")
+    # New explicit ngram mix schedule. If missing, derive from legacy ngram_embed_every
+    # to preserve old behavior exactly.
+    legacy_every = int(model_config_kwargs.get("ngram_embed_every", 4))
+    if "ngram_mix_start_layer" not in model_config_kwargs:
+        start = (n_layer - 1) % legacy_every if n_layer > 0 else 0
+        model_config_kwargs["ngram_mix_start_layer"] = start
+        log0(f"Patching missing ngram_mix_start_layer in model config to {start}")
+    if "ngram_mix_stride" not in model_config_kwargs:
+        model_config_kwargs["ngram_mix_stride"] = legacy_every
+        log0(f"Patching missing ngram_mix_stride in model config to {legacy_every}")
+    if "ngram_mix_count" not in model_config_kwargs:
+        if n_layer > 0:
+            start = int(model_config_kwargs["ngram_mix_start_layer"])
+            stride = int(model_config_kwargs["ngram_mix_stride"])
+            count = max(0, (n_layer - start + stride - 1) // stride)
+        else:
+            count = 0
+        model_config_kwargs["ngram_mix_count"] = count
+        log0(f"Patching missing ngram_mix_count in model config to {count}")
     if "ngram_embeds_on_cpu" not in model_config_kwargs:
         model_config_kwargs["ngram_embeds_on_cpu"] = False
         log0(f"Patching missing ngram_embeds_on_cpu in model config to False")
+    if "gram_num_embeds_enabled" not in model_config_kwargs:
+        model_config_kwargs["gram_num_embeds_enabled"] = False
+        log0(f"Patching missing gram_num_embeds_enabled in model config to False")
+    if "gram_num_vocab_size" not in model_config_kwargs:
+        model_config_kwargs["gram_num_vocab_size"] = 16
+        log0(f"Patching missing gram_num_vocab_size in model config to 16")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -55,6 +82,84 @@ def _patch_missing_keys(model_data, model_config):
     if "x0_lambdas" not in model_data:
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
+    # New ngram gate weights (separate from historical ve_gate), plus slot-indexed
+    # ngram/gram_num embeddings and gram_num_mix_lambdas.
+    use_ngram = bool(model_config.ngram_embeds_enabled and model_config.ngram_vocab_size > 0)
+    selected_layers = []
+    for i in range(n_layer):
+        if i < model_config.ngram_mix_start_layer:
+            continue
+        delta = i - model_config.ngram_mix_start_layer
+        if delta % model_config.ngram_mix_stride != 0:
+            continue
+        slot = delta // model_config.ngram_mix_stride
+        if slot >= model_config.ngram_mix_count:
+            continue
+        selected_layers.append(i)
+
+    # Capture any pre-existing keys (old or new formats) before rewriting.
+    old_ngram = {}
+    old_gram_num = {}
+    old_mix_sparse = {}
+    for k, v in list(model_data.items()):
+        m = re.match(r"^ngram_embeds\.(\d+)\.weight$", k)
+        if m:
+            old_ngram[int(m.group(1))] = v
+            del model_data[k]
+            continue
+        m = re.match(r"^gram_num_embeds\.(\d+)\.weight$", k)
+        if m:
+            old_gram_num[int(m.group(1))] = v
+            del model_data[k]
+            continue
+        m = re.match(r"^gram_num_mix_lambdas\.(\d+)$", k)
+        if m:
+            old_mix_sparse[int(m.group(1))] = v
+            del model_data[k]
+
+    legacy_mix_dense = model_data.pop("gram_num_mix_lambdas", None)
+    if legacy_mix_dense is not None and not isinstance(legacy_mix_dense, torch.Tensor):
+        legacy_mix_dense = None
+
+    if use_ngram:
+        kv_dim = model_config.n_kv_head * (model_config.n_embd // model_config.n_head)
+        for slot, layer_idx in enumerate(selected_layers):
+            # ngram embedding weight (new key uses slot index)
+            nk = f"ngram_embeds.{slot}.weight"
+            if slot in old_ngram:
+                model_data[nk] = old_ngram[slot]
+            elif layer_idx in old_ngram:
+                model_data[nk] = old_ngram[layer_idx]
+            else:
+                model_data[nk] = torch.zeros(model_config.ngram_vocab_size, kv_dim)
+                log0(f"Patching missing {nk} in model data to zeros")
+
+            # optional gram_num embedding weight (new key uses slot index)
+            if model_config.gram_num_embeds_enabled:
+                gk = f"gram_num_embeds.{slot}.weight"
+                if slot in old_gram_num:
+                    model_data[gk] = old_gram_num[slot]
+                elif layer_idx in old_gram_num:
+                    model_data[gk] = old_gram_num[layer_idx]
+                else:
+                    model_data[gk] = torch.zeros(model_config.gram_num_vocab_size, kv_dim)
+                    log0(f"Patching missing {gk} in model data to zeros")
+
+                lk = f"gram_num_mix_lambdas.{slot}"
+                if slot in old_mix_sparse:
+                    model_data[lk] = old_mix_sparse[slot]
+                elif layer_idx in old_mix_sparse:
+                    model_data[lk] = old_mix_sparse[layer_idx]
+                elif legacy_mix_dense is not None and legacy_mix_dense.numel() > layer_idx:
+                    model_data[lk] = legacy_mix_dense[layer_idx].clone().detach()
+                else:
+                    model_data[lk] = torch.tensor(0.1)
+                    log0(f"Patching missing {lk} in model data")
+
+            k = f"transformer.h.{layer_idx}.attn.ng_gate.weight"
+            if k not in model_data:
+                model_data[k] = torch.zeros(model_config.n_kv_head, 32)
+                log0(f"Patching missing {k} in model data to zeros")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:

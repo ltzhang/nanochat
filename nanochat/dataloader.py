@@ -172,12 +172,13 @@ def sampled_ngram_data_loader_with_state(
     device="cuda", resume_state_dict=None, seed=1337,
 ):
     """
-    Dataloader over precomputed fixed-size sampled records plus per-token ngram ids.
+    Dataloader over precomputed fixed-size sampled records plus packed per-token ngram annotations.
 
     sample_bin_path format:
       - uint16 records of shape (chunk_size + 1), where chunk_size must equal T.
     ngram_list_path format:
-      - uint32 records of shape (chunk_size), one ngram id per input token position.
+      - uint32 records of shape (chunk_size), one packed entry per input token:
+        upper 4 bits = gram_num, lower 28 bits = ngram_id.
 
     This loader is intended for pretraining with ngram id supervision.
     """
@@ -202,16 +203,20 @@ def sampled_ngram_data_loader_with_state(
     local_pos = int(resume_local_pos)
 
     row_buffer = torch.empty((B, rec_tokens), dtype=torch.long)
-    row_ngram_buffer = torch.empty((B, T), dtype=torch.long)
+    row_gram_num_buffer = torch.empty((B, T), dtype=torch.long)
+    row_ngram_id_buffer = torch.empty((B, T), dtype=torch.long)
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
-    cpu_ngram = torch.empty(B * T, dtype=torch.long, pin_memory=use_cuda)
+    cpu_gram_num = torch.empty(B * T, dtype=torch.long, pin_memory=use_cuda)
+    cpu_ngram_id = torch.empty(B * T, dtype=torch.long, pin_memory=use_cuda)
     gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
-    gpu_ngram = torch.empty(B * T, dtype=torch.long, device=device)
+    gpu_gram_num = torch.empty(B * T, dtype=torch.long, device=device)
+    gpu_ngram_id = torch.empty(B * T, dtype=torch.long, device=device)
     cpu_inputs = cpu_buffer[:B * T].view(B, T)
     cpu_targets = cpu_buffer[B * T:].view(B, T)
     inputs = gpu_buffer[:B * T].view(B, T)
     targets = gpu_buffer[B * T:].view(B, T)
-    ngram_ids = gpu_ngram.view(B, T)
+    gram_num = gpu_gram_num.view(B, T)
+    ngram_id = gpu_ngram_id.view(B, T)
 
     while True:
         # Deterministic local permutation per epoch; train split shuffles, val is sequential.
@@ -241,19 +246,23 @@ def sampled_ngram_data_loader_with_state(
             tok_start = global_id * rec_tokens
             ng_start = global_id * T
             row_buffer[row_idx].copy_(torch.tensor(token_data[tok_start:tok_start + rec_tokens], dtype=torch.long))
-            row_ngram_buffer[row_idx].copy_(torch.tensor(ngram_data[ng_start:ng_start + T], dtype=torch.long))
+            packed = torch.tensor(ngram_data[ng_start:ng_start + T], dtype=torch.long)
+            row_gram_num_buffer[row_idx].copy_(packed >> 28)
+            row_ngram_id_buffer[row_idx].copy_(packed & 0x0FFFFFFF)
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
-        cpu_ngram.copy_(row_ngram_buffer.view(-1))
+        cpu_gram_num.copy_(row_gram_num_buffer.view(-1))
+        cpu_ngram_id.copy_(row_ngram_id_buffer.view(-1))
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
-        gpu_ngram.copy_(cpu_ngram, non_blocking=use_cuda)
+        gpu_gram_num.copy_(cpu_gram_num, non_blocking=use_cuda)
+        gpu_ngram_id.copy_(cpu_ngram_id, non_blocking=use_cuda)
 
         state_dict = {"epoch": epoch, "local_pos": local_pos, "local_records": local_records}
-        yield inputs, targets, ngram_ids, state_dict
+        yield inputs, targets, gram_num, ngram_id, state_dict
 
 
 def sampled_ngram_data_loader(*args, **kwargs):
     """Helper that omits state_dict from yields."""
-    for inputs, targets, ngram_ids, state_dict in sampled_ngram_data_loader_with_state(*args, **kwargs):
-        yield inputs, targets, ngram_ids
+    for inputs, targets, gram_num, ngram_id, state_dict in sampled_ngram_data_loader_with_state(*args, **kwargs):
+        yield inputs, targets, gram_num, ngram_id

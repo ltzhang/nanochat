@@ -62,7 +62,11 @@ parser.add_argument("--disable-value-embeds", action="store_true", help="disable
 parser.add_argument("--train-sample-bin", type=str, default="", help="path to sampled token records (uint16, shape=(chunk+1)); enables ngram-id training path")
 parser.add_argument("--train-sample-ngram-list", type=str, default="", help="path to sampled ngram id records (uint32, shape=(chunk)); default: <train-sample-bin>.ngram_list")
 parser.add_argument("--ngram-vocab-size", type=int, default=-1, help="total ngram id vocabulary size (including id 0). -1 = infer from ngram_list max id")
-parser.add_argument("--ngram-embed-every", type=int, default=4, help="inject ngram embedding every K layers (counting backward from final layer)")
+parser.add_argument("--disable-ngram-embeds", action="store_true", help="disable ngram embedding module entirely")
+parser.add_argument("--enable-gram-num-embeds", action="store_true", help="enable small gram_num embedding lookup and mix into ngram embedding path")
+parser.add_argument("--ngram-mix-start-layer", type=int, default=3, help="first 0-based layer index to mix ngram embeddings")
+parser.add_argument("--ngram-mix-stride", type=int, default=4, help="layer stride between ngram mix layers")
+parser.add_argument("--ngram-mix-count", type=int, default=999, help="number of layers that mix ngram embeddings")
 parser.add_argument("--ngram-embeds-on-cpu", action="store_true", help="keep ngram embedding parameters on CPU and copy looked-up activations to GPU each step (single-process only)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
@@ -93,6 +97,13 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
+
+if args.ngram_mix_start_layer < 0:
+    raise ValueError("--ngram-mix-start-layer must be >= 0")
+if args.ngram_mix_stride < 1:
+    raise ValueError("--ngram-mix-stride must be >= 1")
+if args.ngram_mix_count < 0:
+    raise ValueError("--ngram-mix-count must be >= 0")
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -151,7 +162,7 @@ def infer_ngram_vocab_size(ngram_list_path):
     ngram_data = np.memmap(ngram_list_path, dtype=np.uint32, mode="r")
     if ngram_data.size == 0:
         return 1
-    max_id = int(ngram_data.max())
+    max_id = int((ngram_data & np.uint32(0x0FFFFFFF)).max())
     return max_id + 1
 
 
@@ -164,18 +175,29 @@ if using_sampled_ngram_data:
         raise FileNotFoundError(f"--train-sample-bin not found: {args.train_sample_bin}")
     if not os.path.exists(train_sample_ngram_list_path):
         raise FileNotFoundError(f"ngram_list file not found: {train_sample_ngram_list_path}")
-    if args.ngram_vocab_size > 0:
+    if args.disable_ngram_embeds:
+        resolved_ngram_vocab_size = 0
+        if args.ngram_vocab_size > 0:
+            print0("Ngram embeddings disabled; ignoring --ngram-vocab-size.")
+    elif args.ngram_vocab_size > 0:
         resolved_ngram_vocab_size = args.ngram_vocab_size
     else:
         resolved_ngram_vocab_size = infer_ngram_vocab_size(train_sample_ngram_list_path)
         print0(f"Auto-inferred ngram_vocab_size={resolved_ngram_vocab_size:,} from {train_sample_ngram_list_path}")
-    if resolved_ngram_vocab_size <= 1:
+    if not args.disable_ngram_embeds and resolved_ngram_vocab_size <= 1:
         raise ValueError(f"Inferred/configured ngram_vocab_size={resolved_ngram_vocab_size}. Expected >1 when using sampled ngram data.")
 else:
     if args.ngram_vocab_size > 0:
         resolved_ngram_vocab_size = args.ngram_vocab_size
         print0(f"WARNING: --ngram-vocab-size={resolved_ngram_vocab_size} set but --train-sample-bin not provided. "
                f"Ngram embeddings will exist in the model but ngram_ids will always be None — they will never be trained.")
+
+ngram_embeds_enabled = not args.disable_ngram_embeds
+effective_ngram_vocab_size = resolved_ngram_vocab_size if ngram_embeds_enabled else 0
+if not ngram_embeds_enabled and resolved_ngram_vocab_size > 0:
+    print0("Ngram embeddings disabled by --disable-ngram-embeds; ignoring ngram vocab/table for model.")
+if args.enable_gram_num_embeds and not ngram_embeds_enabled:
+    print0("WARNING: --enable-gram-num-embeds has no effect when ngram embeddings are disabled.")
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
@@ -193,9 +215,13 @@ def build_model_meta(depth):
         window_pattern=args.window_pattern,
         value_embeds_on_cpu=args.value_embeds_on_cpu,
         value_embeds_enabled=not args.disable_value_embeds,
-        ngram_vocab_size=resolved_ngram_vocab_size,
-        ngram_embed_every=args.ngram_embed_every,
+        ngram_vocab_size=effective_ngram_vocab_size,
+        ngram_embeds_enabled=ngram_embeds_enabled,
+        ngram_mix_start_layer=args.ngram_mix_start_layer,
+        ngram_mix_stride=args.ngram_mix_stride,
+        ngram_mix_count=args.ngram_mix_count,
         ngram_embeds_on_cpu=args.ngram_embeds_on_cpu,
+        gram_num_embeds_enabled=args.enable_gram_num_embeds,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -407,12 +433,15 @@ if using_sampled_ngram_data:
         device=device,
         resume_state_dict=dataloader_resume_state_dict,
     )
-    x, y, ngram_ids, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+    x, y, gram_num, ngram_id, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+    ngram_ids = ngram_id
 else:
     train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
         tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict
     )
     x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+    gram_num = None
+    ngram_id = None
     ngram_ids = None
 
 # -----------------------------------------------------------------------------
@@ -592,7 +621,7 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y, ngram_ids=ngram_ids)
+        loss = model(x, y, ngram_ids=ngram_ids, gram_num=gram_num)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
@@ -600,7 +629,8 @@ while True:
         else:
             loss.backward()
         if using_sampled_ngram_data:
-            x, y, ngram_ids, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+            x, y, gram_num, ngram_id, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+            ngram_ids = ngram_id
         else:
             x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
