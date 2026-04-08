@@ -52,6 +52,9 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--tie-layers-start", type=int, default=-1, help="start layer index (inclusive) for optional weight tying over [start, end)")
+parser.add_argument("--tie-layers-end", type=int, default=-1, help="end layer index (exclusive) for optional weight tying over [start, end)")
+parser.add_argument("--tie-layers-stride", type=int, default=-1, help="group size k for tied contiguous layer groups inside [start, end)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -126,7 +129,7 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth):
+def build_model_meta(depth, tie_layers_start=None, tie_layers_end=None, tie_layers_stride=None):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
@@ -137,13 +140,21 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        tie_layers_start=tie_layers_start,
+        tie_layers_end=tie_layers_end,
+        tie_layers_stride=tie_layers_stride,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
     return model_meta
 
 # Build the model, move to device, init the weights
-model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
+model = build_model_meta(
+    args.depth,
+    tie_layers_start=None if args.tie_layers_start < 0 else args.tie_layers_start,
+    tie_layers_end=None if args.tie_layers_end < 0 else args.tie_layers_end,
+    tie_layers_stride=None if args.tie_layers_stride < 0 else args.tie_layers_stride,
+) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
@@ -159,6 +170,7 @@ if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
+    model._apply_layer_weight_tie()
     del model_data # free up this memory after the copy
 
 # -----------------------------------------------------------------------------
@@ -269,7 +281,7 @@ num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
+d12_ref = build_model_meta(12) # reference baseline for scaling heuristics
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 

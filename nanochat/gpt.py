@@ -37,6 +37,11 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Optional partial layer tying over a half-open layer range [start, end).
+    # Layers in each contiguous group of size tie_layers_stride share transformer matrix weights.
+    tie_layers_start: int | None = None
+    tie_layers_end: int | None = None
+    tie_layers_stride: int | None = None
 
 
 def norm(x):
@@ -168,6 +173,7 @@ class GPT(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
+        self.layer_tie_config = self._validate_layer_tie_config(config)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
@@ -219,9 +225,11 @@ class GPT(nn.Module):
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
         # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
+        self._apply_layer_weight_tie()
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-        for block in self.transformer.h:
+        for layer_idx in self._iter_block_init_indices():
+            block = self.transformer.h[layer_idx]
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
@@ -277,6 +285,56 @@ class GPT(nn.Module):
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
         return cos, sin
 
+    def _validate_layer_tie_config(self, config):
+        start = config.tie_layers_start
+        end = config.tie_layers_end
+        stride = config.tie_layers_stride
+        provided = [value is not None for value in (start, end, stride)]
+        if not any(provided):
+            return None
+        assert all(provided), "tie_layers_start, tie_layers_end, and tie_layers_stride must all be set together"
+        assert 0 <= start < end <= config.n_layer, (
+            f"Invalid tied layer range [{start}, {end}) for n_layer={config.n_layer}"
+        )
+        assert stride > 0, f"tie_layers_stride must be positive, got {stride}"
+        assert (end - start) % stride == 0, (
+            f"Tied layer span ({end - start}) must be divisible by tie_layers_stride ({stride})"
+        )
+        return {"start": start, "end": end, "stride": stride}
+
+    def _share_block_weights(self, src_block, dst_block):
+        # Tie the core transformer matrix weights while keeping per-layer cache indices,
+        # residual scalars, window sizes, and optional VE gates layer-local.
+        dst_block.attn.c_q.weight = src_block.attn.c_q.weight
+        dst_block.attn.c_k.weight = src_block.attn.c_k.weight
+        dst_block.attn.c_v.weight = src_block.attn.c_v.weight
+        dst_block.attn.c_proj.weight = src_block.attn.c_proj.weight
+        dst_block.mlp.c_fc.weight = src_block.mlp.c_fc.weight
+        dst_block.mlp.c_proj.weight = src_block.mlp.c_proj.weight
+
+    def _iter_block_init_indices(self):
+        if self.layer_tie_config is None:
+            return range(self.config.n_layer)
+        start = self.layer_tie_config["start"]
+        end = self.layer_tie_config["end"]
+        stride = self.layer_tie_config["stride"]
+        unique_layer_indices = list(range(start))
+        unique_layer_indices.extend(range(start, end, stride))
+        unique_layer_indices.extend(range(end, self.config.n_layer))
+        return unique_layer_indices
+
+    def _apply_layer_weight_tie(self):
+        if self.layer_tie_config is None:
+            return
+        start = self.layer_tie_config["start"]
+        end = self.layer_tie_config["end"]
+        stride = self.layer_tie_config["stride"]
+        layers = self.transformer["h"]
+        for group_start in range(start, end, stride):
+            src_block = layers[group_start]
+            for layer_idx in range(group_start + 1, group_start + stride):
+                self._share_block_weights(src_block, layers[layer_idx])
+
     def _compute_window_sizes(self, config):
         """
         Compute per-layer window sizes for sliding window attention.
@@ -321,12 +379,12 @@ class GPT(nn.Module):
         - Chinchilla counts the embedding layer as flops (? weird, it's just a lookup => we ignore)
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
-        nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embeddings and per-layer scalars
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel() +
-                          self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
+        # Count logical matmul work, not just unique parameters: tied layers still execute separately.
+        logical_block_matrix_params = sum(
+            sum(p.numel() for p in block.parameters())
+            for block in self.transformer.h
+        )
+        logical_matmul_params = logical_block_matrix_params + self.lm_head.weight.numel()
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
@@ -334,7 +392,7 @@ class GPT(nn.Module):
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
+        num_flops_per_token = 6 * logical_matmul_params + attn_flops
         return num_flops_per_token
 
     def num_scaling_params(self):
