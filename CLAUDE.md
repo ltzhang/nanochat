@@ -2,7 +2,7 @@
 
 When launching long-running training or experiment jobs in this repo:
 
-- Always run them in the background with `nohup` behavior so they continue if the terminal dies.
+- Always run them in the background with tmux so they continue if the terminal dies.
 - Always send logs, summaries, and other run artifacts to the `result/` directory.
 - Always activate the local virtual environment first with `source .venv/bin/activate`.
 
