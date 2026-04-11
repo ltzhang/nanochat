@@ -1,0 +1,16 @@
+d12 layer tying sweep summary
+date: 2026-04-11 05:35:49
+target_tokens_per_run: 1321210944
+actual_tokens_per_run: 1321205760
+num_iterations: 2520
+total_batch_size: 524288
+device_batch_size: 16
+max_seq_len: 2048
+window_pattern: L
+
+run                      first_loss     last_loss      best_loss     
+d12_tie_2_10_k1_defaulttokens 10.398113      2.785088       2.728819      
+d12_tie_2_10_k2_defaulttokens 10.398113      2.828219       2.771681      
+d12_tie_2_10_k4_defaulttokens 10.398113      2.865897       2.810863      
+d12_tie_2_10_k8_defaulttokens 10.398113      2.898287       2.841265      
+d12_untied_defaulttokens 10.398113      2.786309       2.729748      
