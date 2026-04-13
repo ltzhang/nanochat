@@ -12,6 +12,30 @@ import torch.distributed as dist
 from torch import Tensor
 from nanochat.common import COMPUTE_DTYPE
 
+
+def _move_state_value_to_device(value, device):
+    if torch.is_tensor(value):
+        if value.device != device:
+            return value.to(device=device, non_blocking=device.type == "cuda")
+        return value
+    if isinstance(value, dict):
+        return {k: _move_state_value_to_device(v, device) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_move_state_value_to_device(v, device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_move_state_value_to_device(v, device) for v in value)
+    return value
+
+
+def place_optimizer_state(optimizer: torch.optim.Optimizer) -> None:
+    """Move loaded optimizer state tensors onto the device of their owning parameter."""
+    for param, state in optimizer.state.items():
+        if not isinstance(param, torch.Tensor):
+            continue
+        device = param.device
+        for key, value in list(state.items()):
+            state[key] = _move_state_value_to_device(value, device)
+
 # -----------------------------------------------------------------------------
 """
 Good old AdamW optimizer, fused kernel.

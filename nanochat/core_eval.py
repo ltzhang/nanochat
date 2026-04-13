@@ -148,7 +148,11 @@ def forward_model(model, input_ids):
     The last column of losses is set to nan because we don't have autoregressive targets there.
     """
     batch_size, seq_len = input_ids.size()
-    outputs = model(input_ids)
+    ngram_ids = None
+    if getattr(model.config, "use_ngram_embeds", False):
+        ngram_device = model.ngram_embeds.weight.device if model.ngram_embeds is not None else input_ids.device
+        ngram_ids = model.encode_ngram_ids(input_ids, device=ngram_device)
+    outputs = model(input_ids, ngram_ids=ngram_ids)
     # Roll the tensor to the left by one position to get the (autoregressive) target ids
     target_ids = torch.roll(input_ids, shifts=-1, dims=1)
     # Calculate cross entropy at all positions

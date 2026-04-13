@@ -11,3 +11,6 @@ eval_bundle/
 # Local setup
 CLAUDE.md
 wandb/
+result/
+ngram/result/
+__pycache__/

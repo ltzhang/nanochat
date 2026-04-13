@@ -17,6 +17,7 @@ import time
 import wandb
 import torch
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.optim import place_optimizer_state
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
@@ -143,6 +144,7 @@ if args.load_optimizer:
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
         optimizer.load_state_dict(optimizer_data)
+        place_optimizer_state(optimizer)
         del optimizer_data
         for group, base_lr in zip(optimizer.param_groups, base_lrs):
             group["lr"] = base_lr
