@@ -159,8 +159,12 @@ def sample_next_token(logits, rng, temperature=1.0, top_k=None):
 
 class RowState:
     # Per-row state tracking during generation
-    def __init__(self, current_tokens=None):
-        self.current_tokens = current_tokens or [] # Current token sequence for this row
+    def __init__(self, current_tokens=None, ngram_max_order=None):
+        current_tokens = current_tokens or []
+        self.current_tokens = deque(
+            current_tokens[-ngram_max_order:] if ngram_max_order is not None else current_tokens,
+            maxlen=ngram_max_order,
+        ) # only suffix is needed for n-gram lookup
         self.forced_tokens = deque() # Queue of tokens to force inject
         self.in_python_block = False # Whether we are inside a python block
         self.python_expr_tokens = [] # Tokens of the current python expression
@@ -171,6 +175,22 @@ class Engine:
     def __init__(self, model, tokenizer):
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
+
+    def _needs_ngram_ids(self):
+        return getattr(self.model.config, "use_ngram_embeds", False)
+
+    def _encode_prompt_ngram_ids(self, tokens, device):
+        if not self._needs_ngram_ids():
+            return None
+        ngram_device = self.model.ngram_embeds.weight.device if self.model.ngram_embeds is not None else device
+        return self.model.encode_ngram_ids(torch.tensor(tokens, dtype=torch.long), device=ngram_device).unsqueeze(0)
+
+    def _lookup_row_ngram_id(self, tokens):
+        if not self._needs_ngram_ids():
+            return 0
+        if self.model.ngram_lexicon is None:
+            raise ValueError("Model requires n-gram IDs but no n-gram lexicon is loaded")
+        return self.model.ngram_lexicon.longest_suffix_id(tokens)
 
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
@@ -207,7 +227,8 @@ class Engine:
             **kv_model_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        prompt_ngram_ids = self._encode_prompt_ngram_ids(tokens, device)
+        logits = self.model.forward(ids, ngram_ids=prompt_ngram_ids, kv_cache=kv_cache_prefill)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
         # 2) Replicate the KV cache for each sample/row
@@ -223,7 +244,10 @@ class Engine:
         del kv_cache_prefill # no need to keep this memory around
 
         # 3) Initialize states for each sample
-        row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
+        ngram_max_order = None
+        if self._needs_ngram_ids():
+            ngram_max_order = self.model.require_ngram_lexicon().max_order
+        row_states = [RowState(tokens.copy(), ngram_max_order=ngram_max_order) for _ in range(num_samples)]
 
         # 4) Main generation loop
         num_generated = 0
@@ -277,7 +301,14 @@ class Engine:
 
             # Prepare logits for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            ngram_column = None
+            if self._needs_ngram_ids():
+                ngram_column = torch.tensor(
+                    [self._lookup_row_ngram_id(state.current_tokens) for state in row_states],
+                    dtype=torch.long,
+                    device=self.model.ngram_embeds.weight.device if self.model.ngram_embeds is not None else device,
+                ).unsqueeze(1)
+            logits = self.model.forward(ids, ngram_ids=ngram_column, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """

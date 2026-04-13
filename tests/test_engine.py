@@ -20,6 +20,7 @@ class MockConfig:
     n_embd: int = 64
     n_layer: int = 2
     sequence_len: int = 128
+    use_ngram_embeds: bool = False
 
 
 class MockModel:
@@ -36,7 +37,7 @@ class MockModel:
     def get_device(self):
         return self._device
 
-    def forward(self, ids, kv_cache=None):
+    def forward(self, ids, targets=None, ngram_ids=None, kv_cache=None, loss_reduction='mean'):
         """Return uniform logits so sampling is spread across vocab."""
         B, T = ids.shape
         # With FA3, flash_attn_with_kvcache updates cache in-place and we advance position

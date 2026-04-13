@@ -26,10 +26,16 @@ import torch
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.dataloader import (
+    aligned_binary_ngram_data_loader,
+    aligned_binary_ngram_data_loader_with_state,
+    tokenizing_distributed_data_loader_bos_bestfit,
+    tokenizing_distributed_data_loader_with_state_bos_bestfit,
+)
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
+from nanochat.optim import place_optimizer_state
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, move_state_dict_to_model_devices
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from nanochat.flash_attention import HAS_FA3
@@ -52,6 +58,13 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--use-ngram-input", action="store_true", help="train with aligned n-gram IDs from binary shards")
+parser.add_argument("--ngram-vocab-size", type=int, default=0, help="size of flattened n-gram vocabulary (excluding reserved ID 0)")
+parser.add_argument("--train-bin-dir", type=str, default=None, help="directory with token .bin shards and matching .ngram.bin sidecars")
+parser.add_argument("--val-bin-dir", type=str, default=None, help="optional directory with validation token/ngram shards")
+parser.add_argument("--ngram-lexicon-path", type=str, default=None, help="text file mapping n-gram token sequences to global IDs for inference-time longest-match lookup")
+parser.add_argument("--token-embed-device", type=str, default="compute", choices=["compute", "cpu", "gpu"], help="device placement for token embeddings")
+parser.add_argument("--ngram-embed-device", type=str, default="compute", choices=["compute", "cpu", "gpu"], help="device placement for n-gram embeddings")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -78,6 +91,23 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
+if args.train_bin_dir is not None:
+    args.use_ngram_input = True
+if args.use_ngram_input and args.train_bin_dir is None:
+    raise ValueError("--use-ngram-input requires --train-bin-dir")
+if args.use_ngram_input and args.ngram_vocab_size <= 0:
+    raise ValueError("--use-ngram-input requires --ngram-vocab-size > 0")
+if args.token_embed_device == "gpu":
+    args.token_embed_device = "compute"
+if args.ngram_embed_device == "gpu":
+    args.ngram_embed_device = "compute"
+
+
+def resolve_batch_device(placement, compute_device):
+    compute_device = torch.device(compute_device)
+    if placement == "cpu" and compute_device.type != "cpu":
+        return torch.device("cpu")
+    return compute_device
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -137,6 +167,10 @@ def build_model_meta(depth):
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
+        ngram_vocab_size=args.ngram_vocab_size,
+        use_ngram_embeds=args.use_ngram_input,
+        token_embed_device=args.token_embed_device,
+        ngram_embed_device=args.ngram_embed_device,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -147,7 +181,7 @@ model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtyp
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
+model.materialize_on_final_devices(device) # 2) Materialize tensors directly on their final devices
 model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
@@ -155,11 +189,20 @@ base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
+ngram_lexicon_path = args.ngram_lexicon_path
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    model_data = move_state_dict_to_model_devices(model_data, model)
     model.load_state_dict(model_data, strict=True, assign=True)
+    if ngram_lexicon_path is None:
+        ngram_lexicon_path = meta_data.get("ngram_lexicon_path") or meta_data.get("user_config", {}).get("ngram_lexicon_path")
     del model_data # free up this memory after the copy
+if args.use_ngram_input and ngram_lexicon_path is None:
+    raise ValueError("--use-ngram-input requires --ngram-lexicon-path (or checkpoint metadata when resuming)")
+if ngram_lexicon_path is not None:
+    model.load_ngram_lexicon(ngram_lexicon_path)
+    print0(f"Loaded n-gram lexicon: {ngram_lexicon_path}")
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
@@ -243,7 +286,14 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+cpu_hosted_embeddings = (
+    args.token_embed_device == "cpu"
+    or (args.use_ngram_input and args.ngram_embed_device == "cpu")
+)
+if cpu_hosted_embeddings:
+    print0("Skipping torch.compile because one or more embedding tables are hosted on CPU.")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -317,6 +367,7 @@ optimizer = model.setup_optimizer(
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
+    place_optimizer_state(optimizer)
     del optimizer_data
 
 # -----------------------------------------------------------------------------
@@ -328,9 +379,53 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+target_batch_device = device
+token_batch_device = resolve_batch_device(args.token_embed_device, device)
+ngram_batch_device = resolve_batch_device(args.ngram_embed_device, device)
+if args.use_ngram_input:
+    val_bin_dir = args.val_bin_dir if args.val_bin_dir is not None else args.train_bin_dir
+    train_loader = aligned_binary_ngram_data_loader_with_state(
+        args.device_batch_size,
+        args.max_seq_len,
+        split="train",
+        bin_dir=args.train_bin_dir,
+        target_device=target_batch_device,
+        token_device=token_batch_device,
+        ngram_device=ngram_batch_device,
+        resume_state_dict=dataloader_resume_state_dict,
+    )
+    def build_val_loader():
+        val_split = "train" if args.val_bin_dir is not None else "val"
+        return aligned_binary_ngram_data_loader(
+            args.device_batch_size,
+            args.max_seq_len,
+            split=val_split,
+            bin_dir=val_bin_dir,
+            target_device=target_batch_device,
+            token_device=token_batch_device,
+            ngram_device=ngram_batch_device,
+        )
+    x, ng, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+else:
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer,
+        args.device_batch_size,
+        args.max_seq_len,
+        split="train",
+        target_device=target_batch_device,
+        token_device=token_batch_device,
+        resume_state_dict=dataloader_resume_state_dict,
+    )
+    build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(
+        tokenizer,
+        args.device_batch_size,
+        args.max_seq_len,
+        split="val",
+        target_device=target_batch_device,
+        token_device=token_batch_device,
+    )
+    x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+    ng = None
 
 # -----------------------------------------------------------------------------
 # Calculate the number of iterations we will train for and set up the various schedulers
@@ -440,38 +535,44 @@ while True:
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
-        model.eval()
-        with disable_fp8(orig_model):
-            results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
-        model.train()
+        if orig_model.config.use_ngram_embeds and orig_model.ngram_lexicon is None:
+            print0("Skipping CORE evaluation because n-gram embeddings are enabled but no n-gram lexicon is loaded.")
+        else:
+            model.eval()
+            with disable_fp8(orig_model):
+                results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+            print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+            wandb_run.log({
+                "step": step,
+                "total_training_flops": flops_so_far,
+                "core_metric": results["core_metric"],
+                "centered_results": results["centered_results"],
+            })
+            model.train()
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
-        model.eval()
-        prompts = [
-            "The capital of France is",
-            "The chemical symbol of gold is",
-            "If yesterday was Friday, then tomorrow will be",
-            "The opposite of hot is",
-            "The planets of the solar system are:",
-            "My favorite color is",
-            "If 5*x + 3 = 13, then x is",
-        ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
-        model.train()
+        if orig_model.config.use_ngram_embeds and orig_model.ngram_lexicon is None:
+            print0("Skipping sampling because n-gram embeddings are enabled but no n-gram lexicon is loaded.")
+        else:
+            model.eval()
+            prompts = [
+                "The capital of France is",
+                "The chemical symbol of gold is",
+                "If yesterday was Friday, then tomorrow will be",
+                "The opposite of hot is",
+                "The planets of the solar system are:",
+                "My favorite color is",
+                "If 5*x + 3 = 13, then x is",
+            ]
+            engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+            for prompt in prompts:
+                tokens = tokenizer(prompt, prepend="<|bos|>")
+                with disable_fp8(orig_model):
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                print0(tokenizer.decode(sample[0]))
+            model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
@@ -488,6 +589,7 @@ while True:
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
+                "ngram_lexicon_path": ngram_lexicon_path,
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
@@ -508,14 +610,18 @@ while True:
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
+        loss = model(x, targets=y, ngram_ids=ng)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         if scaler is not None:
             scaler.scale(loss).backward()
         else:
             loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        if args.use_ngram_input:
+            x, ng, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        else:
+            x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+            ng = None
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -563,7 +669,10 @@ while True:
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
     else:
         eta_str = ""
-    epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    if "pq_idx" in dataloader_state_dict:
+        epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    else:
+        epoch = f"{dataloader_state_dict['epoch']} shard: {dataloader_state_dict['shard_idx']} row: {dataloader_state_dict['row_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {

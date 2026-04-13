@@ -20,6 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
+from nanochat.ngram import NgramLexicon
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
@@ -29,6 +30,7 @@ from nanochat.flash_attention import flash_attn
 class GPTConfig:
     sequence_len: int = 2048
     vocab_size: int = 32768
+    ngram_vocab_size: int = 0
     n_layer: int = 12
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
@@ -37,6 +39,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    use_ngram_embeds: bool = False
+    token_embed_device: str = "compute"  # compute|cpu
+    ngram_embed_device: str = "compute"  # compute|cpu
 
 
 def norm(x):
@@ -53,6 +58,10 @@ class Linear(nn.Linear):
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
+
+def has_nge(layer_idx, config):
+    return config.use_ngram_embeds and has_ve(layer_idx, config.n_layer)
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
@@ -78,8 +87,9 @@ class CausalSelfAttention(nn.Module):
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.nge_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_nge(layer_idx, config) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, nge, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -93,6 +103,11 @@ class CausalSelfAttention(nn.Module):
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
             v = v + gate.unsqueeze(-1) * ve
+        if nge is not None:
+            assert self.nge_gate is not None, "nge was provided to a layer without nge_gate"
+            nge = nge.view(B, T, self.n_kv_head, self.head_dim)
+            gate = 3 * torch.sigmoid(self.nge_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
+            v = v + gate.unsqueeze(-1) * nge
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
         cos, sin = cos_sin
@@ -145,8 +160,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, nge, cos_sin, window_size, kv_cache):
+        x = x + self.attn(norm(x), ve, nge, cos_sin, window_size, kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -160,6 +175,8 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        self.ngram_lexicon = None
+        self._compute_device = None
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -188,6 +205,7 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.ngram_embeds = nn.Embedding(config.ngram_vocab_size + 1, kv_dim) if config.use_ngram_embeds else None
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -241,11 +259,17 @@ class GPT(nn.Module):
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
+        if self.ngram_embeds is not None:
+            torch.nn.init.uniform_(self.ngram_embeds.weight, -s, s)
+            with torch.no_grad():
+                self.ngram_embeds.weight[0].zero_()
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
+            if block.attn.nge_gate is not None:
+                torch.nn.init.uniform_(block.attn.nge_gate.weight, 0.0, 0.02)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -259,6 +283,8 @@ class GPT(nn.Module):
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
+            if self.ngram_embeds is not None:
+                self.ngram_embeds.to(dtype=COMPUTE_DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -307,7 +333,82 @@ class GPT(nn.Module):
         return window_sizes
 
     def get_device(self):
-        return self.transformer.wte.weight.device
+        if self._compute_device is not None:
+            return self._compute_device
+        return self.cos.device
+
+    def _move_parameter_(self, name, device):
+        param = getattr(self, name)
+        if param.device != device:
+            setattr(self, name, nn.Parameter(param.to(device=device), requires_grad=param.requires_grad))
+
+    def _move_buffer_(self, name, device):
+        buf = getattr(self, name)
+        if buf.device != device:
+            setattr(self, name, buf.to(device=device))
+
+    def set_ngram_lexicon(self, lexicon):
+        if self.config.use_ngram_embeds and lexicon is None:
+            raise ValueError("N-gram models require a loaded n-gram lexicon")
+        self.ngram_lexicon = lexicon
+        if self.config.use_ngram_embeds and self.ngram_lexicon.max_ngram_id > self.config.ngram_vocab_size:
+            raise ValueError(
+                f"N-gram lexicon max ID {self.ngram_lexicon.max_ngram_id} exceeds model config "
+                f"ngram_vocab_size {self.config.ngram_vocab_size}"
+            )
+
+    def load_ngram_lexicon(self, path):
+        self.set_ngram_lexicon(NgramLexicon.from_file(path))
+
+    def require_ngram_lexicon(self):
+        if self.config.use_ngram_embeds and self.ngram_lexicon is None:
+            raise RuntimeError("N-gram model requires a loaded n-gram lexicon for dynamic lookup")
+        return self.ngram_lexicon
+
+    def encode_ngram_ids(self, token_ids, device=None):
+        return self.require_ngram_lexicon().encode_tensor(token_ids, device=device)
+
+    def place_embedding_modules(self, compute_device):
+        compute_device = torch.device(compute_device)
+        self._compute_device = compute_device
+        token_target = torch.device("cpu") if self.config.token_embed_device == "cpu" and compute_device.type != "cpu" else compute_device
+        self.transformer.wte.to(device=token_target)
+        if self.ngram_embeds is not None:
+            ngram_target = torch.device("cpu") if self.config.ngram_embed_device == "cpu" and compute_device.type != "cpu" else compute_device
+            self.ngram_embeds.to(device=ngram_target)
+
+    def materialize_on_final_devices(self, compute_device):
+        """
+        Materialize a meta-initialized model without ever allocating CPU-hosted
+        embedding tables on the compute device first.
+        """
+        compute_device = torch.device(compute_device)
+        self.to_empty(device="cpu")
+        self._compute_device = compute_device
+        self.transformer.h.to(device=compute_device)
+        self.lm_head.to(device=compute_device)
+        self.value_embeds.to(device=compute_device)
+        self.smear_gate.to(device=compute_device)
+        self._move_parameter_("resid_lambdas", compute_device)
+        self._move_parameter_("x0_lambdas", compute_device)
+        self._move_parameter_("smear_lambda", compute_device)
+        self._move_parameter_("backout_lambda", compute_device)
+        self._move_buffer_("cos", compute_device)
+        self._move_buffer_("sin", compute_device)
+        self.place_embedding_modules(compute_device)
+
+    def _embedding_lookup(self, embedding, ids, out_device, out_dtype=None):
+        if embedding is None:
+            return None
+        embed_device = embedding.weight.device
+        if ids.device != embed_device:
+            ids = ids.to(embed_device, non_blocking=out_device.type == "cuda")
+        out = embedding(ids)
+        if out_dtype is not None and out.dtype != out_dtype:
+            out = out.to(dtype=out_dtype)
+        if out.device != out_device:
+            out = out.to(device=out_device, non_blocking=out_device.type == "cuda")
+        return out
 
     def estimate_flops(self):
         """
@@ -324,7 +425,8 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         # Exclude non-matmul params: embeddings and per-layer scalars
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
+        ngram_embeds_numel = 0 if self.ngram_embeds is None else self.ngram_embeds.weight.numel()
+        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel + ngram_embeds_numel +
                           self.resid_lambdas.numel() + self.x0_lambdas.numel() +
                           self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
@@ -352,14 +454,16 @@ class GPT(nn.Module):
         # Count each group separately (mirrors the grouping in setup_optimizers)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
+        ngram_embeds = 0 if self.ngram_embeds is None else sum(p.numel() for p in self.ngram_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + ngram_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
         return {
             'wte': wte,
             'value_embeds': value_embeds,
+            'ngram_embeds': ngram_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
             'scalars': scalars,
@@ -373,12 +477,13 @@ class GPT(nn.Module):
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
+        ngram_embeds_params = [] if self.ngram_embeds is None else list(self.ngram_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(ngram_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -394,6 +499,10 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if ngram_embeds_params:
+            param_groups.append(
+                dict(kind='adamw', params=ngram_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01)
+            )
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -408,28 +517,36 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, ngram_ids=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
+        compute_device = self.get_device()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
-        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+        idx_compute = idx if idx.device == compute_device else idx.to(compute_device, non_blocking=compute_device.type == "cuda")
+        if targets is not None and targets.device != compute_device:
+            targets = targets.to(compute_device, non_blocking=compute_device.type == "cuda")
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
-        x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
+        x = self._embedding_lookup(self.transformer.wte, idx, compute_device, COMPUTE_DTYPE) # embed current token
         x = norm(x)
+        nge = None
+        if self.ngram_embeds is not None:
+            assert ngram_ids is not None, "ngram_ids are required when use_ngram_embeds=True"
+            nge = self._embedding_lookup(self.ngram_embeds, ngram_ids, compute_device, x.dtype)
 
         # Smear: mix previous token's embedding into current position (cheap bigram info)
         if kv_cache is None:
             # Training / naive generate: full sequence available, use fast slice
-            assert T > 1, "Training forward pass should have T > 1"
-            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+            if T == 1:
+                pass
+            else:
+                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
         else:
             # KV cache inference: read prev embedding from cache, store current for next step
             x_pre_smear = kv_cache.prev_embedding
@@ -450,8 +567,8 @@ class GPT(nn.Module):
         x_backout = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            ve = self.value_embeds[str(i)](idx_compute).to(x.dtype) if str(i) in self.value_embeds else None
+            x = block(x, ve, nge if block.attn.nge_gate is not None else None, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
@@ -485,13 +602,18 @@ class GPT(nn.Module):
         """
         assert isinstance(tokens, list)
         device = self.get_device()
+        self.require_ngram_lexicon()
         rng = None
         if temperature > 0:
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
         ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
         for _ in range(max_tokens):
-            logits = self.forward(ids) # (B, T, vocab_size)
+            ngram_ids = None
+            if self.config.use_ngram_embeds:
+                ngram_device = self.ngram_embeds.weight.device if self.ngram_embeds is not None else device
+                ngram_ids = self.encode_ngram_ids(ids, device=ngram_device)
+            logits = self.forward(ids, ngram_ids=ngram_ids) # (B, T, vocab_size)
             logits = logits[:, -1, :] # (B, vocab_size)
             if top_k is not None and top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))

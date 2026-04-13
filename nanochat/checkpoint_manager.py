@@ -9,7 +9,7 @@ import logging
 import torch
 
 from nanochat.common import get_base_dir
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt import GPT, GPTConfig, has_ve
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
 
@@ -26,6 +26,14 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    if "ngram_vocab_size" not in model_config_kwargs:
+        model_config_kwargs["ngram_vocab_size"] = 0
+    if "use_ngram_embeds" not in model_config_kwargs:
+        model_config_kwargs["use_ngram_embeds"] = False
+    if "token_embed_device" not in model_config_kwargs:
+        model_config_kwargs["token_embed_device"] = "compute"
+    if "ngram_embed_device" not in model_config_kwargs:
+        model_config_kwargs["ngram_embed_device"] = "compute"
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -38,6 +46,22 @@ def _patch_missing_keys(model_data, model_config):
     if "x0_lambdas" not in model_data:
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
+    if model_config.use_ngram_embeds:
+        missing_ngram_keys = []
+        if "ngram_embeds.weight" not in model_data:
+            missing_ngram_keys.append("ngram_embeds.weight")
+        for layer_idx in range(n_layer):
+            if has_ve(layer_idx, n_layer):
+                key = f"transformer.h.{layer_idx}.attn.nge_gate.weight"
+                if key not in model_data:
+                    missing_ngram_keys.append(key)
+        if missing_ngram_keys:
+            missing_preview = ", ".join(missing_ngram_keys[:4])
+            raise ValueError(
+                "Checkpoint is missing required n-gram parameters. "
+                "Upgrading a non-n-gram checkpoint into an n-gram model is not supported. "
+                f"Missing keys include: {missing_preview}"
+            )
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
     if rank == 0:
@@ -61,17 +85,34 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-    model_data = torch.load(model_path, map_location=device)
+    model_data = torch.load(model_path, map_location="cpu")
     # Load the optimizer state if requested
     optimizer_data = None
     if load_optimizer:
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
-        optimizer_data = torch.load(optimizer_path, map_location=device)
+        optimizer_data = torch.load(optimizer_path, map_location="cpu")
     # Load the metadata
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
     with open(meta_path, "r", encoding="utf-8") as f:
         meta_data = json.load(f)
     return model_data, optimizer_data, meta_data
+
+
+def move_state_dict_to_model_devices(model_data, model, cast_bf16_to_float=False):
+    """Move checkpoint tensors onto the current device of each owning parameter/buffer."""
+    current_state = model.state_dict()
+    moved = {}
+    for key, tensor in model_data.items():
+        target = current_state.get(key)
+        if target is None:
+            moved[key] = tensor
+            continue
+        if cast_bf16_to_float and target.device.type in {"cpu", "mps"} and tensor.dtype == torch.bfloat16:
+            tensor = tensor.float()
+        if tensor.device != target.device:
+            tensor = tensor.to(target.device, non_blocking=target.device.type == "cuda")
+        moved[key] = tensor
+    return moved
 
 
 def build_model(checkpoint_dir, step, device, phase):
@@ -84,12 +125,6 @@ def build_model(checkpoint_dir, step, device, phase):
     """
     assert phase in ["train", "eval"], f"Invalid phase: {phase}"
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, step, device, load_optimizer=False)
-    if device.type in {"cpu", "mps"}:
-        # Convert bfloat16 tensors to float for CPU inference
-        model_data = {
-            k: v.float() if v.dtype == torch.bfloat16 else v
-            for k, v in model_data.items()
-        }
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
@@ -100,8 +135,9 @@ def build_model(checkpoint_dir, step, device, phase):
     with torch.device("meta"):
         model = GPT(model_config)
     # Load the model state
-    model.to_empty(device=device)
+    model.materialize_on_final_devices(device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
+    model_data = move_state_dict_to_model_devices(model_data, model, cast_bf16_to_float=device.type in {"cpu", "mps"})
     model.load_state_dict(model_data, strict=True, assign=True)
     # Put the model in the right training phase / mode
     if phase == "eval":
@@ -112,6 +148,17 @@ def build_model(checkpoint_dir, step, device, phase):
     tokenizer = get_tokenizer()
     # Sanity check: compatibility between model and tokenizer
     assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {model_config_kwargs['vocab_size']}"
+    lexicon_path = meta_data.get("ngram_lexicon_path") or meta_data.get("user_config", {}).get("ngram_lexicon_path")
+    if model.config.use_ngram_embeds:
+        if not lexicon_path:
+            raise ValueError("N-gram model checkpoint is missing n-gram lexicon metadata")
+        if not os.path.exists(lexicon_path):
+            raise FileNotFoundError(f"N-gram lexicon not found: {lexicon_path}")
+        model.load_ngram_lexicon(lexicon_path)
+        log0(f"Loaded n-gram lexicon: {lexicon_path}")
+    elif lexicon_path and os.path.exists(lexicon_path):
+        model.load_ngram_lexicon(lexicon_path)
+        log0(f"Loaded n-gram lexicon: {lexicon_path}")
     return model, tokenizer, meta_data
 
 
@@ -190,5 +237,5 @@ def load_optimizer_state(source, device, rank, model_tag=None, step=None):
         log0(f"Optimizer checkpoint not found: {optimizer_path}")
         return None
     log0(f"Loading optimizer state from {optimizer_path}")
-    optimizer_data = torch.load(optimizer_path, map_location=device)
+    optimizer_data = torch.load(optimizer_path, map_location="cpu")
     return optimizer_data

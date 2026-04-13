@@ -18,9 +18,48 @@ https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L11
 
 import torch
 import pyarrow.parquet as pq
+import os
 
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
+
+
+def _normalize_device(device):
+    return torch.device(device)
+
+
+def _resolve_token_target_devices(target_device, token_device=None, legacy_device=None):
+    if legacy_device is not None:
+        target_device = legacy_device
+        if token_device is None:
+            token_device = legacy_device
+    if token_device is None:
+        token_device = target_device
+    return _normalize_device(target_device), _normalize_device(token_device)
+
+
+def _resolve_ngram_loader_devices(target_device, token_device=None, ngram_device=None, legacy_device=None):
+    target_device, token_device = _resolve_token_target_devices(
+        target_device, token_device=token_device, legacy_device=legacy_device
+    )
+    if ngram_device is None:
+        if legacy_device is not None:
+            ngram_device = legacy_device
+        else:
+            raise ValueError("aligned n-gram loaders require explicit ngram_device when target_device/token_device are used")
+    return target_device, token_device, _normalize_device(ngram_device)
+
+
+def _allocate_output_buffer(shape, device):
+    use_pinned_cpu = device.type == "cuda"
+    cpu_tensor = torch.empty(shape, dtype=torch.long, pin_memory=use_pinned_cpu)
+    out_tensor = cpu_tensor if device.type == "cpu" else torch.empty(shape, dtype=torch.long, device=device)
+    return cpu_tensor, out_tensor
+
+
+def _copy_to_output(cpu_tensor, out_tensor):
+    if out_tensor.device != cpu_tensor.device:
+        out_tensor.copy_(cpu_tensor, non_blocking=out_tensor.device.type == "cuda")
 
 def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     """
@@ -74,7 +113,7 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
 def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
-    device="cuda", resume_state_dict=None,
+    target_device="cuda", token_device=None, device=None, resume_state_dict=None,
     buffer_size=1000
 ):
     """
@@ -110,14 +149,12 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer
-    use_cuda = device == "cuda"
+    target_device, token_device = _resolve_token_target_devices(
+        target_device, token_device=token_device, legacy_device=device
+    )
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long) # for building rows without creating Python lists
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda) # staging area (CPU)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device) # on-device buffer
-    cpu_inputs = cpu_buffer[:B * T].view(B, T) # a few views into these buffers just for convenience
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    cpu_inputs, inputs = _allocate_output_buffer((B, T), token_device)
+    cpu_targets, targets = _allocate_output_buffer((B, T), target_device)
 
     while True:
         for row_idx in range(B):
@@ -156,11 +193,136 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
         state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
 
-        # Single HtoD copy into persistent GPU buffer and yield
-        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        _copy_to_output(cpu_inputs, inputs)
+        _copy_to_output(cpu_targets, targets)
         yield inputs, targets, state_dict
 
 def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
     """Helper that omits state_dict from yields."""
     for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
         yield inputs, targets
+
+
+def _list_binary_shards(bin_dir):
+    token_paths = sorted(
+        os.path.join(bin_dir, name)
+        for name in os.listdir(bin_dir)
+        if name.endswith(".bin") and not name.endswith(".ngram.bin")
+    )
+    shards = []
+    for token_path in token_paths:
+        ngram_path = token_path[:-4] + ".ngram.bin"
+        if not os.path.exists(ngram_path):
+            raise FileNotFoundError(f"Missing n-gram sidecar for token shard: {token_path} -> {ngram_path}")
+        shards.append((token_path, ngram_path))
+    if not shards:
+        raise FileNotFoundError(f"No token binary shards found in {bin_dir}")
+    return shards
+
+
+def _split_binary_shards(bin_dir, split):
+    shards = _list_binary_shards(bin_dir)
+    if split == "train":
+        if len(shards) == 1:
+            return shards
+        return shards[:-1]
+    return [shards[-1]]
+
+
+def _rows_in_flat_shard(num_tokens, seq_len):
+    if num_tokens < seq_len + 1:
+        return 0
+    return (num_tokens - 1) // seq_len
+
+
+def aligned_binary_ngram_data_loader_with_state(
+    B, T, split, bin_dir,
+    target_device="cuda", token_device=None, ngram_device=None, device=None,
+    resume_state_dict=None
+):
+    """
+    Distributed dataloader over flat token streams with aligned .ngram.bin sidecars.
+
+    Each shard is interpreted as:
+    - token stream of length N
+    - n-gram stream of length N aligned position-wise to tokens
+
+    Training examples are non-overlapping windows with starts at i*T:
+    - input_ids = tokens[start:start+T]
+    - targets   = tokens[start+1:start+T+1]
+    - ngram_ids = ngrams[start:start+T]
+    """
+    assert split in ["train", "val"], "split must be 'train' or 'val'"
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    target_device, token_device, ngram_device = _resolve_ngram_loader_devices(
+        target_device, token_device=token_device, ngram_device=ngram_device, legacy_device=device
+    )
+    shards = _split_binary_shards(bin_dir, split)
+
+    resume_shard_idx = resume_state_dict["shard_idx"] if resume_state_dict is not None else 0
+    resume_row_idx = resume_state_dict["row_idx"] if resume_state_dict is not None else ddp_rank
+    resume_epoch = resume_state_dict.get("epoch", 1) if resume_state_dict is not None else 1
+    first_pass = True
+    shard_idx = resume_shard_idx
+    epoch = resume_epoch
+
+    row_buffer = torch.empty((B, T + 1), dtype=torch.long)
+    ngram_row_buffer = torch.empty((B, T), dtype=torch.long)
+    cpu_inputs, inputs = _allocate_output_buffer((B, T), token_device)
+    cpu_targets, targets = _allocate_output_buffer((B, T), target_device)
+    cpu_ngrams, ngram_ids = _allocate_output_buffer((B, T), ngram_device)
+
+    current_tokens = None
+    current_ngrams = None
+    current_num_rows = 0
+    row_idx = resume_row_idx
+
+    def load_shard(idx):
+        token_path, ngram_path = shards[idx]
+        token_numel = os.path.getsize(token_path) // 4
+        ngram_numel = os.path.getsize(ngram_path) // 4
+        if token_numel != ngram_numel:
+            raise ValueError(
+                f"Token and n-gram shard lengths must match for flat aligned streams: "
+                f"{token_path} has {token_numel} tokens, {ngram_path} has {ngram_numel} ids"
+            )
+        tokens_i32 = torch.from_file(token_path, size=token_numel, dtype=torch.int32)
+        ngrams_i32 = torch.from_file(ngram_path, size=ngram_numel, dtype=torch.int32)
+        return tokens_i32, ngrams_i32, _rows_in_flat_shard(token_numel, T)
+
+    while True:
+        if current_tokens is None:
+            current_tokens, current_ngrams, current_num_rows = load_shard(shard_idx)
+            if first_pass and shard_idx == resume_shard_idx and resume_state_dict is not None:
+                row_idx = resume_row_idx + ddp_rank
+            else:
+                row_idx = ddp_rank
+
+        for batch_row in range(B):
+            while row_idx >= current_num_rows:
+                shard_idx += 1
+                if shard_idx >= len(shards):
+                    shard_idx = 0
+                    epoch += 1
+                    first_pass = False
+                current_tokens, current_ngrams, current_num_rows = load_shard(shard_idx)
+                row_idx = ddp_rank
+            start = row_idx * T
+            row_buffer[batch_row] = current_tokens[start:start + T + 1].to(dtype=torch.long)
+            ngram_row_buffer[batch_row] = current_ngrams[start:start + T].to(dtype=torch.long)
+            row_idx += ddp_world_size
+
+        cpu_inputs.copy_(row_buffer[:, :-1])
+        cpu_targets.copy_(row_buffer[:, 1:])
+        cpu_ngrams.copy_(ngram_row_buffer)
+
+        state_dict = {"shard_idx": shard_idx, "row_idx": row_idx, "epoch": epoch}
+        _copy_to_output(cpu_inputs, inputs)
+        _copy_to_output(cpu_targets, targets)
+        _copy_to_output(cpu_ngrams, ngram_ids)
+        yield inputs, ngram_ids, targets, state_dict
+
+
+def aligned_binary_ngram_data_loader(*args, **kwargs):
+    for inputs, ngram_ids, targets, state_dict in aligned_binary_ngram_data_loader_with_state(*args, **kwargs):
+        yield inputs, ngram_ids, targets
