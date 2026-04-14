@@ -14,3 +14,9 @@ wandb/
 result/
 ngram/result/
 __pycache__/
+
+# C++ ngram build outputs
+ngram/cpp/*.o
+ngram/cpp/*.d
+ngram/cpp/ngram
+ngram/output/
