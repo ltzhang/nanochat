@@ -253,9 +253,9 @@ int cmd_count(int argc, char **argv) {
         else if (argv[i][0] != '-')                               files.push_back(argv[i]);
     }
 
-    if (n < 1 || n > (int)MAX_N) die("count: -n must be 1..%zu", MAX_N);
-    if (out_path.empty())         die("count: -o OUTPUT required");
-    if (files.empty())            die("count: no input files");
+    if (n < 1 || n > (int)MAX_N) { usage_count(); die("count: -n must be 1..%zu (got %d)", MAX_N, n); }
+    if (out_path.empty())        { usage_count(); die("count: -o OUTPUT required"); }
+    if (files.empty())           { usage_count(); die("count: no input files"); }
 
     RobinTable table;
     size_t mem_bytes = mem_gb * (1ULL << 30);

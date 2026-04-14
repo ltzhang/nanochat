@@ -15,11 +15,13 @@
 //   --min-count M     only emit n-grams with count >= M (default 1)
 //   --top-k K         only emit the K most frequent n-grams
 //
-// process ops:
-//   filter-min  -i INPUT -o OUTPUT -t THRESHOLD
-//   count-range -i INPUT -o OUTPUT --min MIN [--max MAX]
-//   sort-count  -i INPUT -o OUTPUT
-//   to-text     -i INPUT -o OUTPUT [--vocab VOCAB_FILE]
+// process ops (-o is optional for all; a descriptive default name is derived
+//              from the input path when omitted):
+//   filter-min  -i INPUT [-o OUTPUT] -t THRESHOLD
+//   sort-count  -i INPUT [-o OUTPUT]
+//   to-text     -i INPUT [-o OUTPUT] [--vocab VOCAB_FILE]
+//   merge       -i INPUT [-i INPUT ...] [-o OUTPUT] [--min-count M]
+//   split       -i INPUT -t THRESHOLD
 
 #include <cstring>
 #include <cstdio>
@@ -46,12 +48,21 @@ static void usage() {
         "  # Step 1: count 2-gram frequencies\n"
         "  ngram count -n 2 -o data/2gram.count.bin data/*.bin\n"
         "\n"
-        "  # Step 2 (optional): dump frequency table as text\n"
-        "  ngram process to-text -i data/2gram.count.bin -o data/2gram.count.txt\n"
+        "  # Step 2 (optional): sort by frequency, print top-k cutoff table\n"
+        "  ngram process sort-count -i data/2gram.count.bin\n"
+        "  # -> writes data/2gram.count.sorted.bin + data/2gram.count_sort_hist.txt\n"
         "\n"
-        "  # Step 3 (optional): merge multiple count tables\n"
-        "  ngram process merge -i shard0.count.bin -i shard1.count.bin \\\n"
-        "                -o merged.count.bin\n",
+        "  # Step 3 (optional): split into high/low frequency halves\n"
+        "  ngram process split -i data/2gram.count.sorted.bin -t 5\n"
+        "  # -> writes 2gram.count.sorted.high_5.bin and .low_5.bin\n"
+        "\n"
+        "  # Step 4 (optional): dump frequency table as text\n"
+        "  ngram process to-text -i data/2gram.count.bin\n"
+        "  # -> writes data/2gram.count.txt\n"
+        "\n"
+        "  # Step 5 (optional): merge multiple count tables\n"
+        "  ngram process merge -i shard0.count.bin -i shard1.count.bin\n"
+        "  # -> writes shard0.count.merged.bin\n",
         stderr);
 }
 

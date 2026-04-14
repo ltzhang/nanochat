@@ -216,9 +216,9 @@ int cmd_batch(int argc, char **argv) {
         else if (argv[i][0] != '-')                               files.push_back(argv[i]);
     }
 
-    if (n_max < 2 || n_max > (int)MAX_N) die("batch: -n must be 2..%zu", MAX_N);
-    if (out_dir.empty()) die("batch: -o OUTDIR required");
-    if (files.empty())   die("batch: no input files specified");
+    if (n_max < 2 || n_max > (int)MAX_N) { usage_batch(); die("batch: -n must be 2..%zu (got %d)", MAX_N, n_max); }
+    if (out_dir.empty()) { usage_batch(); die("batch: -o OUTDIR required"); }
+    if (files.empty())   { usage_batch(); die("batch: no input files specified"); }
     if (workers < 1)     workers = 1;
     if (pre_merge < 1)   pre_merge = 1;
 
