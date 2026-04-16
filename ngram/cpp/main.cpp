@@ -29,6 +29,8 @@
 int cmd_count(int argc, char **argv);
 int cmd_process(int argc, char **argv);
 int cmd_batch(int argc, char **argv);
+int cmd_build_vocab(int argc, char **argv);
+int cmd_ngram_input_gen(int argc, char **argv);
 // int cmd_index(int argc, char **argv);
 // int cmd_sample(int argc, char **argv);
 // int cmd_validate(int argc, char **argv);
@@ -41,6 +43,8 @@ static void usage() {
         "  count   Count n-gram frequencies across corpus files\n"
         "  process Post-process frequency tables\n"
         "  batch   Orchestrate per-file counting + rolling pre-merge\n"
+        "  build_vocab  Select a final n-gram vocabulary TSV\n"
+        "  ngram_input_gen  Generate aligned .ngram.bin sidecars\n"
         "\n"
         "Run 'ngram <subcommand>' with no arguments for per-command help.\n"
         "\n"
@@ -71,6 +75,8 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "count"))  return cmd_count(argc - 2, argv + 2);
     if (!strcmp(argv[1], "process")) return cmd_process(argc - 2, argv + 2);
     if (!strcmp(argv[1], "batch"))  return cmd_batch(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "build_vocab")) return cmd_build_vocab(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "ngram_input_gen")) return cmd_ngram_input_gen(argc - 2, argv + 2);
     // if (!strcmp(argv[1], "index"))  return cmd_index(argc - 2, argv + 2);
     // if (!strcmp(argv[1], "sample")) return cmd_sample(argc - 2, argv + 2);
     // if (!strcmp(argv[1], "validate")) return cmd_validate(argc - 2, argv + 2);

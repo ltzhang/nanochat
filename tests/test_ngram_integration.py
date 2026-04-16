@@ -194,6 +194,119 @@ def test_gpt_forward_accepts_cpu_ngram_ids_with_gpu_compute():
     assert torch.isfinite(loss)
 
 
+def test_ngram_training_step_matches_between_gpu_and_cpu_ngram_embedding_paths(tmp_path):
+    if not torch.cuda.is_available():
+        return
+
+    token_path = tmp_path / "shard0.bin"
+    ngram_path = tmp_path / "shard0.ngram.bin"
+    torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9], dtype=torch.int32).numpy().tofile(token_path)
+    torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.int32).numpy().tofile(ngram_path)
+
+    loader_gpu = aligned_binary_ngram_data_loader_with_state(
+        B=2,
+        T=4,
+        split="train",
+        bin_dir=str(tmp_path),
+        target_device="cuda",
+        token_device="cuda",
+        ngram_device="cuda",
+    )
+    loader_cpu = aligned_binary_ngram_data_loader_with_state(
+        B=2,
+        T=4,
+        split="train",
+        bin_dir=str(tmp_path),
+        target_device="cuda",
+        token_device="cuda",
+        ngram_device="cpu",
+    )
+
+    x_gpu, ng_gpu, y_gpu, _ = next(loader_gpu)
+    x_cpu, ng_cpu, y_cpu, _ = next(loader_cpu)
+
+    assert x_gpu.device.type == "cuda"
+    assert y_gpu.device.type == "cuda"
+    assert ng_gpu.device.type == "cuda"
+    assert ng_cpu.device.type == "cpu"
+    assert torch.equal(x_gpu.cpu(), x_cpu.cpu())
+    assert torch.equal(y_gpu.cpu(), y_cpu.cpu())
+    assert torch.equal(ng_gpu.cpu(), ng_cpu.cpu())
+
+    common_kwargs = dict(
+        sequence_len=8,
+        vocab_size=32768,
+        ngram_vocab_size=8,
+        n_layer=4,
+        n_head=2,
+        n_kv_head=2,
+        n_embd=256,
+        window_pattern="L",
+        use_ngram_embeds=True,
+        token_embed_device="compute",
+    )
+    gpu_config = GPTConfig(**common_kwargs, ngram_embed_device="compute")
+    cpu_config = GPTConfig(**common_kwargs, ngram_embed_device="cpu")
+
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed_all(1234)
+    model_gpu = GPT(gpu_config)
+    model_gpu.materialize_on_final_devices("cuda")
+    model_gpu.init_weights()
+
+    model_cpu = GPT(cpu_config)
+    model_cpu.materialize_on_final_devices("cuda")
+    model_cpu.init_weights()
+    model_cpu.load_state_dict(model_gpu.state_dict())
+
+    optimizer_gpu = model_gpu.setup_optimizer(
+        unembedding_lr=1e-3,
+        embedding_lr=1e-3,
+        matrix_lr=1e-3,
+        weight_decay=0.0,
+        scalar_lr=1e-3,
+    )
+    optimizer_cpu = model_cpu.setup_optimizer(
+        unembedding_lr=1e-3,
+        embedding_lr=1e-3,
+        matrix_lr=1e-3,
+        weight_decay=0.0,
+        scalar_lr=1e-3,
+    )
+
+    losses_gpu = []
+    losses_cpu = []
+    for _ in range(2):
+        optimizer_gpu.zero_grad(set_to_none=True)
+        optimizer_cpu.zero_grad(set_to_none=True)
+
+        loss_gpu = model_gpu(x_gpu, targets=y_gpu, ngram_ids=ng_gpu)
+        loss_cpu = model_cpu(x_cpu, targets=y_cpu, ngram_ids=ng_cpu)
+        assert torch.isfinite(loss_gpu)
+        assert torch.isfinite(loss_cpu)
+        losses_gpu.append(float(loss_gpu.detach().cpu()))
+        losses_cpu.append(float(loss_cpu.detach().cpu()))
+
+        loss_gpu.backward()
+        loss_cpu.backward()
+        optimizer_gpu.step()
+        optimizer_cpu.step()
+
+    assert losses_gpu == losses_cpu
+
+    gpu_state = model_gpu.state_dict()
+    cpu_state = model_cpu.state_dict()
+    assert gpu_state.keys() == cpu_state.keys()
+    for key in gpu_state:
+        torch.testing.assert_close(
+            gpu_state[key].detach().cpu().float(),
+            cpu_state[key].detach().cpu().float(),
+            rtol=0.0,
+            atol=0.0,
+            msg=f"Mismatch for {key}",
+        )
+
+
 def test_ngram_model_requires_lexicon_for_dynamic_lookup():
     config = GPTConfig(
         sequence_len=8,

@@ -32,6 +32,7 @@ class NgramLexicon:
     - each data line is one of:
         <global_id>\t<token0 token1 ...>
         <global_id>\t<n>\t<token0 token1 ...>
+        <global_id>\t<n>\t<token0 token1 ...>\t<count>\t<display_text>
     """
 
     def __init__(self, entries):

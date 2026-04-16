@@ -13,7 +13,9 @@ SRCS := \
 	$(SRC_DIR)/main.cpp \
 	$(SRC_DIR)/cmd_count.cpp \
 	$(SRC_DIR)/cmd_process.cpp \
-	$(SRC_DIR)/cmd_batch.cpp
+	$(SRC_DIR)/cmd_batch.cpp \
+	$(SRC_DIR)/cmd_build_vocab.cpp \
+	$(SRC_DIR)/cmd_ngram_input_gen.cpp
 
 OBJS := $(SRCS:$(SRC_DIR)/%.cpp=$(SRC_DIR)/%.o)
 DEPS := $(OBJS:.o=.d)

@@ -81,18 +81,21 @@ On-disk format:
 ```text
 <global_id>\t<token0 token1 ...>
 <global_id>\t<n>\t<token0 token1 ...>
+<global_id>\t<n>\t<token0 token1 ...>\t<count>\t<display_text>
 ```
 
 Examples:
 ```text
 1	10 20
 2	3	10 20 30
+3	2	42 99	1234	hello world
 ```
 
 Properties:
 - `global_id` must be a positive integer
 - `0` is reserved and must not appear as a real n-gram ID
 - If the optional `n` column is present, it must match the number of token IDs on the line
+- Additional columns after the token field are allowed and ignored by the current loader
 - The same token sequence must not appear with conflicting IDs
 
 Runtime semantics:

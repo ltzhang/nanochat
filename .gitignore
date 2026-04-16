@@ -20,3 +20,4 @@ ngram/cpp/*.o
 ngram/cpp/*.d
 ngram/cpp/ngram
 ngram/output/
+results/
